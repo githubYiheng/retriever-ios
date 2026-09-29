@@ -26,7 +26,9 @@ extension Engine {
         if pauseActive && backoff.pausedCategories.contains("all") {
             return .stop(reason: "paused", wakeMono: backoff.pausedUntilMono)
         }
-        if backoff.nextAtMonoMs > nowMono { return .stop(reason: "backoff", wakeMono: backoff.nextAtMonoMs) }
+        if backoff.nextAtMonoMs > nowMono {
+            return .stop(reason: backoff.reason == "network" ? "offline" : "backoff", wakeMono: backoff.nextAtMonoMs)
+        }
         if let last = lastRequestMono, nowMono < last + Limits.minRequestSpacingMs {
             return .stop(reason: "spacing", wakeMono: last + Limits.minRequestSpacingMs)
         }
@@ -150,6 +152,10 @@ extension Engine {
         metas.removeValue(forKey: meta.name)
         fails.removeValue(forKey: meta.name)
         for k in fails.keys { fails[k]?.otherSuccess = true }
+        if meta.kind == .primary && meta.oseqFrom > 0 {
+            ackedRanges.append((meta.sessionId, meta.oseqFrom, meta.oseqTo))
+            if ackedRanges.count > 512 { ackedRanges.removeFirst(ackedRanges.count - 512) }
+        }
         // 删已报墓碑与会话终态（按原样匹配）
         if !meta.drops.isEmpty || !meta.closed.isEmpty {
             FS.withDirLock(root) {
@@ -236,12 +242,6 @@ extension Engine {
         return w.max()
     }
 
-    /// flush 用：primary 批都已确认 = stored。
-    var hasPendingPrimary: Bool {
-        reconcileOutbox()
-        return metas.values.contains { $0.prio <= 1 }
-    }
-
     // MARK: 远程配置（§5）
 
     func configRequest() -> HTTPRequest? {
@@ -254,6 +254,7 @@ extension Engine {
             "X-Rtv-Upload-Level": host.uploadLevel.rawValue,
             "X-Rtv-Local-Level": (host.localLevel ?? .debug).rawValue,
             "X-Rtv-Daily-Batch-Cap": String(host.dailyBatchCap ?? 0),
+            "X-Rtv-Local-Cap-Bytes": String(host.localCapBytes),
         ]
         if let u = writer.currentUser {
             // 值一律 percent-encode（ASCII 字母数字以外全部编码，服务端 decodeURIComponent）

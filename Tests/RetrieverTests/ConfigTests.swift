@@ -23,9 +23,12 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(r.headers["X-Rtv-Upload-Level"], "warn")
         XCTAssertEqual(r.headers["X-Rtv-Local-Level"], "debug")
         XCTAssertEqual(r.headers["X-Rtv-Daily-Batch-Cap"], "7")
+        XCTAssertEqual(r.headers["X-Rtv-Local-Cap-Bytes"], String(20 * 1024 * 1024))
         XCTAssertEqual(r.headers["X-Rtv-User"], "%E5%BC%A0%E4%B8%89%20u%2F1")
         XCTAssertEqual(r.headers["X-Rtv-User"]?.removingPercentEncoding, "张三 u/1")
-        // 生效：info 行成义务行，debug 行不写
+        // 生效：info 行成义务行，debug 行不写；公开只读级别同步
+        XCTAssertEqual(h.client.effectiveLevels.upload, .info)
+        XCTAssertEqual(h.client.effectiveLevels.local, .info)
         let before = h.client.debugCounters
         h.client.log(.debug, "filtered")
         h.client.log(.info, "obligation now")
@@ -78,14 +81,16 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(t.batchRequests.count, 0)
         XCTAssertEqual(h.outboxFiles().count, 1)
         let r = await h.client.flush()
-        XCTAssertEqual(r, .pending("upload_disabled"))
+        XCTAssertEqual(r, .pending("paused"))
+        XCTAssertEqual(h.outboxFiles().count, 2, "flush 的批也只落盘")
         // 恢复：upload_enabled 变化触发封段并排空
         t.configBody = ["etag": "y", "upload_enabled": true]
         h.client.log(.warn, "more")
         await h.tick(advance: Int64(Limits.configPollIntervalS) * 1000)
         await h.tick(advance: 2000)
+        await h.tick(advance: 2000)
         XCTAssertEqual(h.outboxFiles(), [])
-        XCTAssertEqual(t.batchRequests.count, 2)
+        XCTAssertEqual(t.batchRequests.count, 3)
     }
 
     func testBackfillWaitsForUnmeteredNetwork() async throws {

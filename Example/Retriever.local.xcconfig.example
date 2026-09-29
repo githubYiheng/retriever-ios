@@ -1,0 +1,4 @@
+// 复制为 Retriever.local.xcconfig（gitignored）或运行 ./gen-local-xcconfig.sh 生成。
+// staging 只接受 lk_test_ 开头的 key；xcconfig 里 URL 的 `//` 要写成 `/$()/`。
+RETRIEVER_KEY = lk_test_<app>_<random>_<crc>
+RETRIEVER_BASE_URL = https:/$()/logs-staging.revdog.org

@@ -38,6 +38,8 @@ public final class RetrieverClient: PlatformEventSink, @unchecked Sendable {
         var bgToken: Int?
         var tombstoneScheduled = false
         var closed = false
+        /// flush 等待窗口（测试可调小）。
+        var flushWindowMs: Int64 = RetrieverClient.flushWindowMs
 
         func with<T>(_ body: (Control) -> T) -> T {
             lock.lock()
@@ -165,17 +167,91 @@ public final class RetrieverClient: PlatformEventSink, @unchecked Sendable {
         }
     }
 
-    /// 「上报问题」：视同一次 error 触发（带 ctx）并尽力排空；primary 批都已确认 → stored，否则 pending(原因)。
+    /// 「上报问题」：向当前段追加合成行（error / tag rtv.flush / synthetic，一定是义务行），立即封段并排空。
+    /// 该批 15 s 内被 2xx 确认 → `.stored`；否则 `.pending(offline | backoff | paused | timeout)`；
+    /// `setEnabled(false)` 时 `.pending("disabled")`。`includeContext == false` 时该批不带 ctx。
     public func flush(includeContext: Bool = true) async -> FlushResult {
         guard writer.isEnabled else { return .pending("disabled") }
-        writer.rotate(.flush, forceCtx: includeContext)
+        let enc = LineEncoder.encode(LogLine(ts: clock.wallMs(), level: .error, msg: "flush", tag: "rtv.flush"), synthetic: true)
+        let sid = writer.currentSessionId
+        guard let marker = writer.appendFlushMarker(body: enc.body, noCtx: !includeContext) else {
+            return .pending("timeout")
+        }
         await onWork { [self] in _ = engine.processSeals() }
-        await drainPatiently(budgetMs: 60_000)
-        let pending = await onWork { [self] in engine.hasPendingPrimary }
-        if !pending { return .stored }
-        let stop = ctl.with { $0.lastStop }
-        return .pending(stop.reason.isEmpty ? "pending" : stop.reason)
+        // 窗口用注入时钟计（退避 / 间隔等待）；另用真实时间兜住在途请求挂起的情况
+        let window = ctl.with { $0.flushWindowMs }
+        return await withCheckedContinuation { (c: CheckedContinuation<FlushResult, Never>) in
+            let once = FlushOnce(c)
+            let timer = Task.detached {
+                try? await Task.sleep(nanoseconds: UInt64(window) * 1_000_000)
+                once.resume(.pending("timeout"))
+            }
+            once.onResume = { timer.cancel() }
+            Task.detached { [self] in
+                once.resume(await flushWait(sessionId: sid, marker: marker, window: window, once: once))
+            }
+        }
     }
+
+    private func flushWait(sessionId sid: String, marker: Int64, window: Int64, once: FlushOnce) async -> FlushResult {
+        let deadline = clock.monoMs() + window
+        while !once.done {
+            await drainNow()
+            if await onWork({ [self] in engine.isAcked(sessionId: sid, oseq: marker) }) { return .stored }
+            let stop = ctl.with { $0.lastStop }
+            let now = clock.monoMs()
+            if now < deadline, ["spacing", "backoff", "offline"].contains(stop.reason), let w = stop.wake, w <= deadline,
+               !ctl.with({ $0.stopRequested || $0.closed }) {
+                await clock.sleep(ms: max(0, w - now))
+                continue
+            }
+            return .pending(RetrieverClient.flushReason(stop.reason))
+        }
+        return .pending("timeout")
+    }
+
+    static let flushWindowMs: Int64 = 15_000
+
+    /// 只 resume 一次（flush 的等待与超时兜底谁先到用谁）。
+    final class FlushOnce: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cont: CheckedContinuation<FlushResult, Never>?
+        var onResume: (@Sendable () -> Void)? {
+            get { lock.lock(); defer { lock.unlock() }; return _onResume }
+            set { lock.lock(); _onResume = newValue; lock.unlock() }
+        }
+        private var _onResume: (@Sendable () -> Void)?
+
+        init(_ c: CheckedContinuation<FlushResult, Never>) { cont = c }
+
+        var done: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return cont == nil
+        }
+
+        func resume(_ r: FlushResult) {
+            lock.lock()
+            let c = cont
+            cont = nil
+            let hook = _onResume
+            lock.unlock()
+            guard let c else { return }
+            hook?()
+            c.resume(returning: r)
+        }
+    }
+
+    static func flushReason(_ stop: String) -> String {
+        switch stop {
+        case "offline": return "offline"
+        case "backoff": return "backoff"
+        case "paused", "upload_disabled", "not_configured", "locked", "metered", "disabled": return "paused"
+        default: return "timeout"
+        }
+    }
+
+    /// 生效的上传 / 本地级别（远程配置钳制后；适配器早过滤用）。
+    public var effectiveLevels: (upload: LogLevel, local: LogLevel) { writer.levels }
 
     public func setEnabled(_ enabled: Bool) {
         writer.setEnabled(enabled)
@@ -202,6 +278,8 @@ public final class RetrieverClient: PlatformEventSink, @unchecked Sendable {
             engine.fails = [:]
             engine.inFlight = nil
             engine.backoff = BackoffState()
+            engine.ackedRanges = []
+            engine.backfilledSegs = []
             engine.configCache = nil
             engine.lastConfigFetchMono = nil
             engine.install = nil
@@ -549,6 +627,8 @@ public final class RetrieverClient: PlatformEventSink, @unchecked Sendable {
             engine.releaseSessionLock()
         }
     }
+
+    public func setFlushWindowForTesting(_ ms: Int64) { ctl.with { $0.flushWindowMs = ms } }
 
     public var debugCounters: (seq: Int64, oseq: Int64) {
         let s = writer.snapshot

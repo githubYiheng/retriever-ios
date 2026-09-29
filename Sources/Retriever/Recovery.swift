@@ -145,14 +145,14 @@ extension Engine {
                 newTombs.removeAll()
             }
             // 按 error 封段带 ctx（合成 error 在批内 → 自动附 ctx）
-            materialize(rec, targetOseq: maxOseq, targetSeq: maxSeq, forceCtx: false, ignoreCap: true)
+            materialize(rec, targetOseq: maxOseq, targetSeq: maxSeq, noCtx: false, ignoreCap: true)
             rec.cursor.closedMs = now
             writeCursor(rec)
             register(rec)
         } else {
             let rec = SessionRecord(meta: meta, dir: dir, cursor: cursor, sealed: sealAll(files))
             if maxOseq > cursor.extractedThroughOseq {
-                materialize(rec, targetOseq: maxOseq, targetSeq: maxSeq, forceCtx: false, ignoreCap: true)
+                materialize(rec, targetOseq: maxOseq, targetSeq: maxSeq, noCtx: false, ignoreCap: true)
             }
             register(rec)
         }

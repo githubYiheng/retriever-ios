@@ -213,8 +213,8 @@ final class Harness {
     func settle() async { await client.settle() }
 
     /// 立即封当前段并处理（不走定时器）。
-    func seal(_ reason: SealReason = .timer, forceCtx: Bool = false) async {
-        client.writer.rotate(reason, forceCtx: forceCtx)
+    func seal(_ reason: SealReason = .timer) async {
+        client.writer.rotate(reason)
         let c = client
         await c.onWork { _ = c.engine.processSeals() }
         await settle()

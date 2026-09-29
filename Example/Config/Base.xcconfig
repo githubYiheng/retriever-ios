@@ -1,0 +1,7 @@
+// 示例 app 的构建配置。key 与 baseURL 从 gitignored 的 ../Retriever.local.xcconfig 覆盖
+// （由 ../gen-local-xcconfig.sh 从仓库根 .env 生成）；没有该文件时 key 为空 = 只写本地不上传。
+// 注意 xcconfig 里 `//` 是注释，URL 要写成 https:/$()/host。
+RETRIEVER_KEY =
+RETRIEVER_BASE_URL = https:/$()/logs-staging.revdog.org
+
+#include? "../Retriever.local.xcconfig"

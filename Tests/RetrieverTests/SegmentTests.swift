@@ -173,21 +173,75 @@ final class SegmentTests: XCTestCase {
         for r in results { XCTAssertEqual(r["ok"] as? Bool, true, "\(r)") }
     }
 
-    func testFlushReturnsStoredAfterAck() async throws {
+    func flushLine(_ e: [String: Any]) -> [String: Any]? { lines(of: e).first { $0["tag"] as? String == "rtv.flush" } }
+
+    func testFlushWithContextStoredAfterAck() async throws {
         let h = Harness()
         await h.settle()
         h.client.log(.info, "user tapped report")
-        h.client.log(.warn, "problem")
+        h.client.log(.debug, "detail")
         let r = await h.client.flush(includeContext: true)
         XCTAssertEqual(r, .stored)
         let e = try XCTUnwrap(h.transport.batchRequests.last.flatMap { decodeEnvelope($0.body!) })
-        XCTAssertEqual(lines(of: e).first?["ctx"] as? Bool, true, "flush 视同 error：带 ctx")
+        let marker = try XCTUnwrap(flushLine(e))
+        XCTAssertEqual(marker["level"] as? String, "error")
+        XCTAssertEqual(marker["msg"] as? String, "flush")
+        XCTAssertEqual(marker["synthetic"] as? Bool, true)
+        XCTAssertEqual(int(marker["oseq"]), 1)
+        XCTAssertEqual(lines(of: e).filter { $0["ctx"] as? Bool == true }.map { $0["msg"] as? String }, ["user tapped report", "detail"])
+        XCTAssertTrue(h.transport.batchRequests.last?.url.path.hasSuffix("/v1/batches") ?? false)
+        XCTAssertEqual(h.outboxFiles(), [])
+    }
+
+    func testFlushWithoutContextAndAboveUploadLevel() async throws {
+        var o = Options()
+        o.uploadLevel = .fatal
+        o.localLevel = .fatal
+        let h = Harness(options: o)
+        await h.settle()
+        h.client.log(.fatal, "earlier fatal")          // p0，带不带 ctx 无所谓
+        h.client.log(.info, "filtered by localLevel")
+        await h.settle()
+        let n0 = h.transport.batchRequests.count
+        let r = await h.client.flush(includeContext: false)
+        XCTAssertEqual(r, .stored)
+        XCTAssertGreaterThan(h.transport.batchRequests.count, n0)
+        let e = try XCTUnwrap(h.transport.batchRequests.compactMap { decodeEnvelope($0.body!) }.first { flushLine($0) != nil })
+        XCTAssertEqual(lines(of: e).filter { $0["ctx"] as? Bool == true }.count, 0, "includeContext = false 不带 ctx")
+        XCTAssertNil(e["ctx_truncated"])
+        XCTAssertNotNil(flushLine(e)?["oseq"], "uploadLevel 高于 error 也是义务行")
+    }
+
+    func testFlushPendingReasons() async throws {
+        let h = Harness()
+        await h.settle()
         h.transport.defaultReply = .network
-        h.client.log(.warn, "offline")
-        let r2 = await h.client.flush()
-        XCTAssertEqual(r2, .pending("backoff"))
+        let offline = await h.client.flush()
+        XCTAssertEqual(offline, .pending("offline"))
+        // 退避回到 0 后测 401 → paused
+        await h.work { $0.backoff = BackoffState() }
+        h.transport.defaultReply = .status(401, ["reason": "key_invalid"], [:])
+        await h.tick(advance: 3000)
+        let paused = await h.client.flush()
+        XCTAssertEqual(paused, .pending("paused"))
+        // 503 + Retry-After 1 h：退避超出 15 s 窗口 → backoff
+        await h.work { $0.backoff = BackoffState() }
+        h.transport.defaultReply = .status(503, ["reason": "storage", "retry_after_s": 3600], ["retry-after": "3600"])
+        await h.tick(advance: 3000)
+        let backoff = await h.client.flush()
+        XCTAssertEqual(backoff, .pending("backoff"))
+        // 在途请求挂起 → 真实时间兜底 timeout
+        await h.work { $0.backoff = BackoffState() }
+        h.transport.defaultReply = .hang
+        h.client.setFlushWindowForTesting(200)
+        h.clock.advance(3000)                     // 越过 2 s 间隔，让 flush 的批立即在途
+        let timeout = await h.client.flush()
+        XCTAssertEqual(timeout, .pending("timeout"))
+        XCTAssertEqual(h.transport.hangingCount, 1)
+        h.transport.cancelAll()
+        await h.settle()
         h.client.setEnabled(false)
-        let r3 = await h.client.flush()
-        XCTAssertEqual(r3, .pending("disabled"))
+        let disabled = await h.client.flush()
+        XCTAssertEqual(disabled, .pending("disabled"))
     }
 }

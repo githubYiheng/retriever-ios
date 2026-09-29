@@ -26,8 +26,8 @@ extension Engine {
 
     /// 义务行 = 本会话 oseq ∈ (extracted_through_oseq, targetOseq]，按 oseq 连续取走；
     /// 用户边界与 oseq 缺口（write_failed / 驱逐 / 损坏已记墓碑）处切批；解压后 ≤ 768 KB，超出按 oseq 切多批；
-    /// 本批含 error / fatal（或 flush 要求）时附 ctx；没有义务行 → 不产生批次。
-    func materialize(_ s: SessionRecord, targetOseq: Int64, targetSeq: Int64, forceCtx: Bool, ignoreCap: Bool) {
+    /// 本批含 error / fatal 时附 ctx（flush(includeContext: false) 的 noCtx 除外）；没有义务行 → 不产生批次。
+    func materialize(_ s: SessionRecord, targetOseq: Int64, targetSeq: Int64, noCtx: Bool, ignoreCap: Bool) {
         let now = clock.wallMs()
         guard let inst = install else { return }
         var cache: [Int: SegmentFile] = [:]
@@ -115,9 +115,8 @@ extension Engine {
         }
         if let c = curChunk { chunks.append(c) }
 
-        // ctx：附在最后一个含 error 的批（flush 要求时附在最后一批）
-        var ctxTarget: Int? = chunks.lastIndex { $0.hasError }
-        if ctxTarget == nil && forceCtx { ctxTarget = chunks.count - 1 }
+        // ctx：附在最后一个含 error 的批
+        let ctxTarget: Int? = noCtx ? nil : chunks.lastIndex { $0.hasError }
         if let t = ctxTarget {
             let user = chunks[t].user
             let hb = headerBytes(user: user, extras: chunks[t].extras ? extras : nil, mapping: chunks[t].mapping)
@@ -287,36 +286,54 @@ extension Engine {
 
     // MARK: backfill（full_dump 生效时；§3.5 / §5）
 
-    /// 对 RETAINED 段中没有作为 ctx 上传过（seq > ctx_through_seq）的非义务行按段生成 backfill 批（p2，不带 oseq）。
-    func materializeBackfill() {
+    /// 对 RETAINED 段中**全部非义务行**按段生成 backfill 批（p2，不带 oseq）；与已上传 ctx 重复的行由读侧按
+    /// (session_id, seq) 去重（主代理 2026-09-29 裁决）。每段一批，batch_id = `…:backfill:<seg_no>`；
+    /// 超 768 KB 的段按 seq 切多批，batch_id = `…:backfill:<seg_no>:<seq_from>`。本进程内同一段只生成一次。
+    func materializeBackfill(budget: Int = Limits.batchUncompressedBytesClient) {
         guard let inst = install else { return }
         let now = clock.wallMs()
         for s in ownSessions {
-            var through = s.cursor.ctxThroughSeq
-            for info in s.sealed where info.lastSeq > s.cursor.ctxThroughSeq {
-                if info.lineCount == info.obligCount { through = max(through, info.lastSeq); continue }
+            for info in s.sealed where info.lineCount > info.obligCount {
+                let key = "\(s.meta.sessionId):\(info.segNo)"
+                if backfilledSegs.contains(key) { continue }
                 guard let f = Segments.read(info.url, validate: false) else { continue }
-                var lines: [OLine] = f.lines.filter { $0.oseq == 0 && $0.seq > s.cursor.ctxThroughSeq }.map {
+                let lines: [OLine] = f.lines.filter { $0.oseq == 0 }.map {
                     OLine(seq: $0.seq, oseq: 0, ts: $0.ts, rank: $0.levelRank, raw: Array(f.data[$0.range]))
+                }.sorted { $0.seq < $1.seq }
+                if lines.isEmpty { backfilledSegs.insert(key); continue }
+                func header(_ part: [OLine], batchId: String) -> EnvelopeHeader {
+                    EnvelopeHeader(kind: .backfill, batchId: batchId, createdMs: now,
+                                   day: Day.clientDay(tsMinMs: part.map(\.ts).min() ?? now, createdMs: now),
+                                   installId: inst.installId, sessionId: s.meta.sessionId, sessionNo: s.meta.sessionNo,
+                                   process: s.meta.process, userId: info.userId, device: s.meta.device,
+                                   seqFrom: part.first!.seq, seqTo: part.last!.seq, oseqFrom: nil, oseqTo: nil, ctxTruncated: nil)
                 }
-                if lines.isEmpty { through = max(through, info.lastSeq); continue }
-                // 一个段 ≤ 512 KB + 一行，放得进 768 KB；保险起见超出时保留最新的
-                var total = lines.reduce(0) { $0 + $1.raw.count + 1 } + 2048
-                while total > Limits.batchUncompressedBytesClient && lines.count > 1 {
-                    total -= lines.removeFirst().raw.count + 1
+                // 按 seq 切：头部按最大位数占位估算
+                let headBytes = header(lines, batchId: IDs.namespace).encodePrefix().count + 2 + 64
+                var parts: [[OLine]] = [[]]
+                var size = 0
+                for l in lines {
+                    let cost = l.raw.count + 1
+                    if !parts[parts.count - 1].isEmpty && headBytes + size + cost > budget {
+                        parts.append([])
+                        size = 0
+                    }
+                    parts[parts.count - 1].append(l)
+                    size += cost
                 }
-                guard let bid = IDs.batchId(installId: inst.installId, sessionId: s.meta.sessionId, kind: .backfill, n: Int64(info.segNo)) else { continue }
-                let h = EnvelopeHeader(kind: .backfill, batchId: bid, createdMs: now,
-                                       day: Day.clientDay(tsMinMs: lines.map(\.ts).min() ?? now, createdMs: now),
-                                       installId: inst.installId, sessionId: s.meta.sessionId, sessionNo: s.meta.sessionNo,
-                                       process: s.meta.process, userId: info.userId, device: s.meta.device,
-                                       seqFrom: lines.first!.seq, seqTo: lines.last!.seq, oseqFrom: nil, oseqTo: nil, ctxTruncated: nil)
-                guard writeBatch(h, lines: lines.map(\.raw), prio: 2) != nil else { break }
-                through = max(through, info.lastSeq)
-            }
-            if through > s.cursor.ctxThroughSeq {
-                s.cursor.ctxThroughSeq = through
-                writeCursor(s)
+                var ok = true
+                for part in parts {
+                    let bid = parts.count == 1
+                        ? IDs.batchId(installId: inst.installId, sessionId: s.meta.sessionId, kind: .backfill, n: Int64(info.segNo))
+                        : IDs.backfillSplitBatchId(installId: inst.installId, sessionId: s.meta.sessionId,
+                                                   segNo: Int64(info.segNo), seqFrom: part.first!.seq)
+                    guard let bid, writeBatch(header(part, batchId: bid), lines: part.map(\.raw), prio: 2) != nil else {
+                        ok = false
+                        break
+                    }
+                }
+                if !ok { return }
+                backfilledSegs.insert(key)
             }
         }
     }

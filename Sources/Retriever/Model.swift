@@ -124,7 +124,8 @@ struct SealJob {
     var fd: Int32
     var info: SegInfo
     var reason: SealReason
-    var forceCtx: Bool
+    /// flush(includeContext: false)：本次物化不附 ctx。
+    var noCtx: Bool
     /// 换段时刻的全局 seq / oseq（物化的上界）。
     var seqAtSeal: Int64
     var oseqAtSeal: Int64

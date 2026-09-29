@@ -8,18 +8,14 @@ final class EvictionTests: XCTestCase {
     func prepare() async -> Harness {
         let h = Harness(key: "")
         await h.settle()
+        // 先生成一个 p2（只覆盖第一段），再塞两段 RETAINED 作驱逐对象
+        h.client.log(.debug, "backfill me")
+        await h.seal()
+        await h.work { $0.materializeBackfill() }
         for _ in 0..<2 {
             let seg = h.client.writer.snapshot.segNo
             while h.client.writer.snapshot.segNo == seg { h.client.log(.debug, String(repeating: "d", count: 300)) }
             await h.settle()
-        }
-        h.client.log(.debug, "backfill me")
-        await h.seal()
-        await h.work { e in
-            // 让 backfill 只覆盖最后一段（前两段留作 RETAINED 驱逐对象）
-            let cur = e.current!
-            cur.cursor.ctxThroughSeq = cur.sealed[1].lastSeq
-            e.materializeBackfill()
         }
         h.client.log(.warn, "to quarantine")
         await h.seal()

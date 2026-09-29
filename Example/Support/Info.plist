@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- 与 GENERATE_INFOPLIST_FILE 合并；值来自 Config/Base.xcconfig（可被 Retriever.local.xcconfig 覆盖） -->
+	<key>RetrieverKey</key>
+	<string>$(RETRIEVER_KEY)</string>
+	<key>RetrieverBaseURL</key>
+	<string>$(RETRIEVER_BASE_URL)</string>
+</dict>
+</plist>

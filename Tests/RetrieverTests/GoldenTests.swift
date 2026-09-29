@@ -34,6 +34,17 @@ final class GoldenTests: XCTestCase {
         }
     }
 
+    /// backfill 切分 batch_id（三段 name）：与 `uuidv5(ns, "<install>:<session>:backfill:<seg_no>:<seq_from>")` 一致。
+    func testBackfillSplitBatchIdName() {
+        let iid = "3f2c9a4e-8b1d-4c7a-9e5f-0a1b2c3d4e5f"
+        let sid = "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+        let bid = IDs.backfillSplitBatchId(installId: iid, sessionId: sid, segNo: 3, seqFrom: 1201)
+        XCTAssertEqual(bid, IDs.uuidv5(namespace: IDs.namespace, name: "\(iid):\(sid):backfill:3:1201"))
+        XCTAssertNotEqual(bid, IDs.batchId(installId: iid, sessionId: sid, kind: .backfill, n: 3))
+        XCTAssertTrue(IDs.isUuid(bid!))
+        XCTAssertNil(IDs.backfillSplitBatchId(installId: iid.uppercased(), sessionId: sid, segNo: 3, seqFrom: 1))
+    }
+
     func testIdsUuidRegex() throws {
         let g = try Repo.golden("ids.json")
         for s in try XCTUnwrap(g["uuid_valid"] as? [String]) { XCTAssertTrue(IDs.isUuid(s), s) }

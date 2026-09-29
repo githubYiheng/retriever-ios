@@ -60,6 +60,10 @@ final class Engine: @unchecked Sendable {
     /// 恢复流程拿不到某个旧会话目录的锁 = 该会话还活着（别的进程 / 同进程另一实例），跳过不动。
     var sessionLockFd: Int32 = -1
 
+    /// 最近被 2xx 确认的 primary 区间（flush 判断「这一批已确认」用；只留最近 512 个）。
+    var ackedRanges: [(sessionId: String, from: Int64, to: Int64)] = []
+    /// 本进程已生成过 backfill 的段（"<session_id>:<seg_no>"），full_dump 反复生效时不重复生成。
+    var backfilledSegs: Set<String> = []
     /// 本进程写出的批文件计数（判断「这次封段有没有产生批次」）。
     var batchesWritten = 0
     var todayDay = ""
@@ -235,10 +239,10 @@ final class Engine: @unchecked Sendable {
             }
         }
         let last = jobs[jobs.count - 1]
-        let forceCtx = jobs.contains { $0.forceCtx }
+        let noCtx = jobs.contains { $0.noCtx }
         let ignoreCap = jobs.contains { $0.reason == .flush || $0.reason == .fatal || $0.reason == .shutdown }
         let before = batchesWritten
-        materialize(cur, targetOseq: last.oseqAtSeal, targetSeq: last.seqAtSeal, forceCtx: forceCtx, ignoreCap: ignoreCap)
+        materialize(cur, targetOseq: last.oseqAtSeal, targetSeq: last.seqAtSeal, noCtx: noCtx, ignoreCap: ignoreCap)
         flushTombstones()
         evictIfNeeded()
         return batchesWritten != before
@@ -314,6 +318,10 @@ final class Engine: @unchecked Sendable {
     }
 
     // MARK: 杂项
+
+    func isAcked(sessionId: String, oseq: Int64) -> Bool {
+        ackedRanges.contains { $0.sessionId == sessionId && $0.from <= oseq && oseq <= $0.to }
+    }
 
     static func digest(_ d: Device) -> String {
         var o = JSONOut()

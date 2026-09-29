@@ -81,6 +81,13 @@ enum IDs {
         return uuidv5(namespace: namespace, name: batchIdName(installId: installId, sessionId: sessionId, kind: kind, n: n))
     }
 
+    /// backfill 段超 768 KB 按 seq 切多批时的 batch_id：
+    /// UUIDv5(RETRIEVER_NAMESPACE, `${install_id}:${session_id}:backfill:${seg_no}:${seq_from}`)（主代理 2026-09-29 裁决）。
+    static func backfillSplitBatchId(installId: String, sessionId: String, segNo: Int64, seqFrom: Int64) -> String? {
+        guard isUuid(installId), isUuid(sessionId), segNo >= 0, seqFrom >= 1 else { return nil }
+        return uuidv5(namespace: namespace, name: "\(installId):\(sessionId):backfill:\(segNo):\(seqFrom)")
+    }
+
     /// 新的随机 UUID（v4，小写）。
     static func newV4() -> String { UUID().uuidString.lowercased() }
 }

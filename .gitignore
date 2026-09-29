@@ -1,4 +1,5 @@
 .build/
 .swiftpm/
 Example/Secrets.xcconfig
+Example/Retriever.local.xcconfig
 *.xcodeproj

@@ -127,6 +127,12 @@ final class Writer: @unchecked Sendable {
         return enabled && level.rank >= localRank
     }
 
+    /// 生效的上传 / 本地级别（远程配置钳制后；full_dump 期间上传级别为 debug）。
+    var levels: (upload: LogLevel, local: LogLevel) {
+        lock.lock(); defer { lock.unlock() }
+        return (LogLevel.allCases[uploadRank], LogLevel.allCases[localRank])
+    }
+
     var currentUser: String? {
         lock.lock(); defer { lock.unlock() }
         return user
@@ -135,16 +141,32 @@ final class Writer: @unchecked Sendable {
     // MARK: 热路径
 
     func append(level: LogLevel, body: [UInt8]) -> Outcome {
-        var out = Outcome()
         lock.lock()
         defer { lock.unlock() }
-        guard enabled, level.rank >= localRank, sessionDir != nil else { return out }
+        return appendLocked(level: level, body: body, forced: false)
+    }
+
+    /// flush 的合成行（level error、tag rtv.flush、synthetic）：无视 local_level / upload_level 一定是义务行，
+    /// 写完立即封段。返回该行的 oseq（写失败 nil，已记 write_failed 墓碑）。
+    func appendFlushMarker(body: [UInt8], noCtx: Bool) -> Int64? {
+        lock.lock()
+        defer { lock.unlock() }
+        let out = appendLocked(level: .error, body: body, forced: true)
+        guard out.written else { return nil }
+        let o = oseq
+        _ = rotateLocked(.flush, noCtx: noCtx)
+        return o
+    }
+
+    private func appendLocked(level: LogLevel, body: [UInt8], forced: Bool) -> Outcome {
+        var out = Outcome()
+        guard enabled, forced || level.rank >= localRank, sessionDir != nil else { return out }
         let now = clock.monoMs()
         if fd < 0 && now >= nextReopenMono {
             if !openSegmentLocked(cur.segNo == 0 ? 1 : cur.segNo) { nextReopenMono = now + 1000 }
         }
         seq += 1
-        let oblig = level.rank >= uploadRank
+        let oblig = forced || level.rank >= uploadRank
         if oblig { oseq += 1 }
         let pre = LineEncoder.prefix(seq: seq, oseq: oblig ? oseq : 0)
         var buf = [UInt8]()
@@ -172,9 +194,10 @@ final class Writer: @unchecked Sendable {
             cur.obligCount += 1
             if level.rank >= LogLevel.error.rank { cur.hasError = true }
         }
+        if forced { return out }
         if level == .fatal {
             // fatal：立即封段并物化（调用方在锁外同步处理，只落盘不尝试上传）
-            if rotateLocked(.fatal, forceCtx: false) { out.rotated = true; out.fatal = true }
+            if rotateLocked(.fatal, noCtx: false) { out.rotated = true; out.fatal = true }
             return out
         }
         if oblig && level == .error && errorDeadline == nil {
@@ -186,7 +209,7 @@ final class Writer: @unchecked Sendable {
             out.deadlineChanged = true
         }
         if cur.bytes >= Int64(Limits.segmentBytes) {
-            out.rotated = rotateLocked(.size, forceCtx: false)
+            out.rotated = rotateLocked(.size, noCtx: false)
         }
         return out
     }
@@ -226,9 +249,9 @@ final class Writer: @unchecked Sendable {
 
     /// 锁内换段：当前段（有行才换）交给 work 队列封，立即打开下一段。
     @discardableResult
-    private func rotateLocked(_ reason: SealReason, forceCtx: Bool) -> Bool {
+    private func rotateLocked(_ reason: SealReason, noCtx: Bool) -> Bool {
         guard fd >= 0, cur.lineCount > 0 else { return false }
-        pending.append(SealJob(fd: fd, info: cur, reason: reason, forceCtx: forceCtx, seqAtSeal: seq, oseqAtSeal: oseq))
+        pending.append(SealJob(fd: fd, info: cur, reason: reason, noCtx: noCtx, seqAtSeal: seq, oseqAtSeal: oseq))
         if cur.hasError { lastErrorSealMono = clock.monoMs() }
         errorDeadline = nil
         warnDeadline = nil
@@ -240,11 +263,11 @@ final class Writer: @unchecked Sendable {
     /// 外部触发的封段（flush / full_dump / upload_enabled / 进后台 / 关停）。
     /// `onlyIfObligation`：进后台、warn 计时只在段内有义务行时封。
     @discardableResult
-    func rotate(_ reason: SealReason, forceCtx: Bool = false, onlyIfObligation: Bool = false) -> Bool {
+    func rotate(_ reason: SealReason, onlyIfObligation: Bool = false) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         if onlyIfObligation && cur.obligCount == 0 { return false }
-        return rotateLocked(reason, forceCtx: forceCtx)
+        return rotateLocked(reason, noCtx: false)
     }
 
     /// setUser：值变化即封段；当前段还没有行时直接改写 header（用户边界 = 段边界）。
@@ -263,7 +286,7 @@ final class Writer: @unchecked Sendable {
             }
         }
         if fd < 0 { cur.userId = u; return false }
-        return rotateLocked(.user, forceCtx: false)
+        return rotateLocked(.user, noCtx: false)
     }
 
     /// 定时器：error 去抖到期 / warn 计时到期（仅当有义务行）。
@@ -273,11 +296,11 @@ final class Writer: @unchecked Sendable {
         let now = clock.monoMs()
         if let d = errorDeadline, now >= d {
             errorDeadline = nil
-            if rotateLocked(.error, forceCtx: false) { return true }
+            if rotateLocked(.error, noCtx: false) { return true }
         }
         if let w = warnDeadline, now >= w {
             warnDeadline = nil
-            if cur.obligCount > 0 { return rotateLocked(.timer, forceCtx: false) }
+            if cur.obligCount > 0 { return rotateLocked(.timer, noCtx: false) }
         }
         return false
     }

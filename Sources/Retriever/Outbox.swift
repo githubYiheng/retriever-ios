@@ -262,7 +262,7 @@ extension Engine {
         if total > cap, let cur = current, (cur.sealed.last?.lastOseq ?? 0) > cur.cursor.extractedThroughOseq {
             // daily cap 推迟的义务行先物化，保证 RETAINED 段不带义务
             materialize(cur, targetOseq: cur.sealed.map(\.lastOseq).max() ?? 0,
-                        targetSeq: cur.sealed.last?.lastSeq ?? 0, forceCtx: false, ignoreCap: true)
+                        targetSeq: cur.sealed.last?.lastSeq ?? 0, noCtx: false, ignoreCap: true)
             reconcileOutbox()
             total = remaining.reduce(0) { $0 + $1.size } + metas.values.reduce(0) { $0 + $1.bytes }
                 + (FS.size(writer.currentSegmentURL ?? URL(fileURLWithPath: "/nonexistent")) ?? 0)

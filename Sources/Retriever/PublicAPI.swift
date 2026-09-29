@@ -81,7 +81,7 @@ public struct Options: Sendable {
     public init() {}
 }
 
-/// `flush()` 的结果：`stored` = 出站箱里的 primary 批都已被服务端确认；`pending` 附原因。
+/// `flush()` 的结果：`stored` = flush 产生的批 15 s 内已被服务端确认；`pending` 附原因（offline / backoff / paused / timeout）。
 public enum FlushResult: Sendable, Equatable {
     case stored
     case pending(String)
@@ -114,6 +114,16 @@ public enum Retriever {
 
     public static func purgeLocal() {
         SharedClient.shared.client().purgeLocal()
+    }
+
+    /// 生效的自动上传级别（远程配置钳制后；full_dump 期间为 debug）。未 configure 时 = Options 默认。
+    public static var uploadLevel: LogLevel {
+        SharedClient.shared.client().effectiveLevels.upload
+    }
+
+    /// 生效的本地落盘级别（远程配置钳制后）。适配器用它早过滤。未 configure 时 = Options 默认。
+    public static var localLevel: LogLevel {
+        SharedClient.shared.client().effectiveLevels.local
     }
 
     public static var installId: String? {
