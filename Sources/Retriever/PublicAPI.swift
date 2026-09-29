@@ -62,7 +62,7 @@ public struct LogLine: Sendable {
 /// SDK 版本号（唯一来源）：进 `device.sdk = "retriever-ios/<ver>"` 与 `X-Rtv-Sdk`。
 /// 发布门禁（`scripts/sdk-ios-release.sh`）要求它 == 发布版本号。
 public enum RetrieverVersion {
-    public static let current = "0.1.0"
+    public static let current = "0.1.1"
 }
 
 /// 宿主选项（§3.10；ADR 0004 / 0005）。

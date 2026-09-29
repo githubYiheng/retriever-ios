@@ -3,6 +3,10 @@
 本仓库（`githubYiheng/retriever-ios`）是 Retriever monorepo `sdk/ios` 的只读发布镜像（`git subtree split`）；
 改动一律回 monorepo。版本号遵循语义化版本：修订号 = 只修 bug；次版本 = 公开 API 只增；主版本 = 公开 API 有减或改。
 
+## [0.1.1] - 2026-09-29
+
+- 修复：`retry_after_s` 巨大或负数时 `Int(v)` 可能 trap，改为饱和到 0–86 400 s（Android 复核发现）。
+
 ## [0.1.0] - 2026-09-29
 
 首个版本。协议 v1（信封 `v: 1`），最低 iOS 15 / macOS 12，Swift 6（SPM，swift-tools 6.1）。

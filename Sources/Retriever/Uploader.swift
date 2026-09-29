@@ -126,8 +126,9 @@ extension Engine {
     }
 
     static func retryAfter(body: [String: Any]?, header: String?) -> Int? {
-        if let v = JSONIn.double(body?["retry_after_s"]), v.isFinite { return Int(v) }
-        if let h = header, let v = Int(h.trimmingCharacters(in: .whitespaces)) { return v }
+        // 饱和到 [0, 86 400]：服务端若回 1e300 之类，`Int(v)` 会直接 trap（Android 版同样饱和）。
+        if let v = JSONIn.double(body?["retry_after_s"]), v.isFinite { return Int(min(max(v, 0), 86_400)) }
+        if let h = header, let v = Int(h.trimmingCharacters(in: .whitespaces)) { return min(max(v, 0), 86_400) }
         return nil
     }
 
