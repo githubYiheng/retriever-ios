@@ -59,6 +59,12 @@ public struct LogLine: Sendable {
     }
 }
 
+/// SDK 版本号（唯一来源）：进 `device.sdk = "retriever-ios/<ver>"` 与 `X-Rtv-Sdk`。
+/// 发布门禁（`scripts/sdk-ios-release.sh`）要求它 == 发布版本号。
+public enum RetrieverVersion {
+    public static let current = "0.1.0"
+}
+
 /// 宿主选项（§3.10；ADR 0004 / 0005）。
 public struct Options: Sendable {
     /// 自动上传级别（ADR 0004）：该级别及以上的行是义务行（有 oseq）。远程配置可覆盖。
@@ -76,7 +82,7 @@ public struct Options: Sendable {
     /// 可选：App Group 共享容器（扩展场景）。
     public var appGroup: String? = nil
     /// 进 `device.sdk = "retriever-ios/<ver>"` 与 `X-Rtv-Sdk`。
-    public var sdkVersion: String = "0.1.0"
+    public var sdkVersion: String = RetrieverVersion.current
 
     public init() {}
 }

@@ -1,5 +1,10 @@
+# 本文件随 subtree split 进公开仓库，必须自足（不依赖 monorepo 根 .gitignore）
 .build/
 .swiftpm/
+build/
+DerivedData/
+.DS_Store
+*.xcodeproj
+Example/build/
 Example/Secrets.xcconfig
 Example/Retriever.local.xcconfig
-*.xcodeproj

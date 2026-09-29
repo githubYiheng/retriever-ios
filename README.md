@@ -8,6 +8,21 @@ Swift 6 SPM 包，iOS 15+ / macOS 12+。规格：`docs/plan/system-design.md` §
 | `RetrieverSwiftLog` | swift-log ≥ 1.12.0 | `RetrieverLogHandler` |
 | `RetrieverCocoaLumberjack` | CocoaLumberjack ≥ 3.10.0（`CocoaLumberjackSwift`） | `RetrieverDDLogger` |
 
+## 安装
+
+```swift
+// Package.swift
+.package(url: "https://github.com/githubYiheng/retriever-ios.git", from: "0.1.0"),
+// target 依赖按需选：
+.product(name: "Retriever", package: "retriever-ios"),
+.product(name: "RetrieverSwiftLog", package: "retriever-ios"),         // 用 swift-log 时
+.product(name: "RetrieverCocoaLumberjack", package: "retriever-ios"),  // 用 CocoaLumberjack 时
+```
+
+Xcode：File → Add Package Dependencies… 填同一个 URL，Dependency Rule 选 Up to Next Major Version。
+**公开仓库只读**：它是 monorepo `sdk/ios` 的 subtree split 发布镜像，issue / PR 不在那里处理，改动一律回 monorepo。
+版本变更见 `CHANGELOG.md`。
+
 ## 接入
 
 ```swift
@@ -39,6 +54,36 @@ Retriever.log(.error, "purchase failed", tag: "billing", attrs: ["code": .number
   活着的会话目录持有 flock，别的进程不会把它当孤儿恢复。
 - **gzip**：请求体是单成员标准 gzip（zlib windowBits 31），无尾随字节；文件字节即请求体，重试原样重发。
 - **网络**：SDK 用自己的 ephemeral `URLSession`，不经宿主的 session / 拦截器；服务端不回 3xx，SDK 也不跟随重定向。
+
+## os.Logger 项目怎么接
+
+`Retriever` 本体自带 `RetrieverLogger`（不需要额外依赖），方法名与 `os.Logger` 相同：只换构造，每条同时写 os.Logger
+（`privacy: .public`）和 Retriever。tag = category，attrs 自动带 `subsystem`；级别 debug → debug、info / notice → info、
+warning → warn、error → error、fault → fatal；低于 `Retriever.localLevel` 的行不进 Retriever（os.Logger 照写）。
+
+```swift
+import Retriever
+
+// 1. 启动时 configure（key / baseURL 从 Info.plist 读，见下）
+let key = Bundle.main.object(forInfoDictionaryKey: "RetrieverKey") as? String ?? ""
+let base = (Bundle.main.object(forInfoDictionaryKey: "RetrieverBaseURL") as? String).flatMap(URL.init(string:))
+Retriever.configure(key: key, baseURL: base ?? URL(string: "https://logs.revdog.org")!)
+
+// 2. 原来的 Logger(subsystem:category:) 换成 RetrieverLogger，调用处不改
+let log = RetrieverLogger(subsystem: "com.example.app", category: "billing")
+log.error("purchase failed", attrs: ["sku": .string("pro")], error: err)
+```
+
+key 用 xcconfig 注入（与示例 app 一致，不进仓库）：
+
+```
+// Config/Retriever.local.xcconfig（gitignored；xcconfig 里 `//` 是注释，URL 写成 https:/$()/host）
+RETRIEVER_KEY = lk_live_<app>_<random>_<crc>
+RETRIEVER_BASE_URL = https:/$()/logs.revdog.org
+```
+
+在 target 的基础 xcconfig 里 `#include? "Retriever.local.xcconfig"`，Info.plist 加两项：
+`RetrieverKey` = `$(RETRIEVER_KEY)`、`RetrieverBaseURL` = `$(RETRIEVER_BASE_URL)`。没有本地文件时 key 为空：只写本地不上传。
 
 ## 适配器
 
