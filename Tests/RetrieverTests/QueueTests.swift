@@ -22,7 +22,7 @@ final class QueueTests: XCTestCase {
         XCTAssertEqual(r.headers["Content-Encoding"], "gzip")
         XCTAssertEqual(r.headers["X-Rtv-Install"], h.client.installId)
         XCTAssertEqual(r.headers["X-Rtv-Sent-Ms"], String(h.clock.wallMs()))
-        XCTAssertEqual(r.headers["X-Rtv-Sdk"], "retriever-ios/0.1.0")
+        XCTAssertEqual(r.headers["X-Rtv-Sdk"], "retriever-ios/\(RetrieverVersion.current)")
         let e = env(r)
         XCTAssertEqual(e["kind"] as? String, "primary")
         XCTAssertEqual(int(e["oseq_from"]), 1)

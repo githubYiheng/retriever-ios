@@ -18,7 +18,7 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(r.url.absoluteString, "https://logs-test.invalid/v1/config")
         XCTAssertEqual(r.headers["Authorization"], "Bearer lk_test_demo_abc_12345678")
         XCTAssertEqual(r.headers["X-Rtv-Install"], h.client.installId)
-        XCTAssertEqual(r.headers["X-Rtv-Sdk"], "retriever-ios/0.1.0")
+        XCTAssertEqual(r.headers["X-Rtv-Sdk"], "retriever-ios/\(RetrieverVersion.current)")
         XCTAssertEqual(r.headers["X-Rtv-App-Version"], "1.2.3")
         XCTAssertEqual(r.headers["X-Rtv-Upload-Level"], "warn")
         XCTAssertEqual(r.headers["X-Rtv-Local-Level"], "debug")

@@ -40,7 +40,7 @@ final class BackupAndPerfTests: XCTestCase {
         let meta = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(contentsOf: h.sessionDir().appendingPathComponent("meta.json"))) as? [String: Any])
         XCTAssertEqual(int(meta["session_no"]), 1)
         XCTAssertEqual(meta["process"] as? String, "main")
-        XCTAssertEqual((meta["device"] as? [String: Any])?["sdk"] as? String, "retriever-ios/0.1.0")
+        XCTAssertEqual((meta["device"] as? [String: Any])?["sdk"] as? String, "retriever-ios/\(RetrieverVersion.current)")
         // 第二次启动：计数器 +1，install_id 不变
         let h2 = Harness(root: h.root, key: "")
         await h2.settle()
