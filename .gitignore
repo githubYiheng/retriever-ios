@@ -1,0 +1,4 @@
+.build/
+.swiftpm/
+Example/Secrets.xcconfig
+*.xcodeproj
