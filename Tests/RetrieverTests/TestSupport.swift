@@ -282,10 +282,10 @@ final class Harness {
     }
 }
 
-/// 等后台任务（detached Task）达成条件：最长约 1 s 真实时间，不推进假时钟。
+/// 等后台任务（detached Task）达成条件：最长约 5 s 真实时间（与 Android 同类等待一致，负载高时不偶发），不推进假时钟。
 func waitFor(_ cond: () -> Bool) async {
     var n = 0
-    while !cond() && n < 500 {
+    while !cond() && n < 2500 {
         try? await Task.sleep(nanoseconds: 2_000_000)
         n += 1
     }
