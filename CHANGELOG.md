@@ -3,6 +3,12 @@
 本仓库（`githubYiheng/retriever-ios`）是 Retriever monorepo `sdk/ios` 的只读发布镜像（`git subtree split`）；
 改动一律回 monorepo。版本号遵循语义化版本：修订号 = 只修 bug；次版本 = 公开 API 只增；主版本 = 公开 API 有减或改。
 
+## [0.1.3] - 2026-09-30
+
+### 新增
+- `PrivacyInfo.xcprivacy` 随包分发：声明 required-reason API（文件时间戳 `C617.1`：`fstat` 读自己的段文件；磁盘空间 `E174.1`：写前检查可用空间）与收集的数据类型（User ID、Crash Data、Other Diagnostic Data；均不用于跟踪，用途 App Functionality）。宿主上传 App Store Connect 不再因 SDK 缺清单报 ITMS-91053。
+- README「脱敏」：宿主可用 `Options.redact` 在落盘前掩码 URL / 交易 id 等标识（bff 的做法）。
+
 ## [0.1.2] - 2026-09-30
 
 - 删除：backfill 批的网络类型判定（原先 `backfill_networks = unmetered` 时计量网络上不传 backfill）与远程配置字段 `backfill_networks`（ADR 0009：任何能力都不再考虑网络类型，该传就传）。backfill 批与其它批按同一套队列 / 退避规则上传；服务端旧配置里残留该字段按未知字段忽略。

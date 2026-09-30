@@ -145,3 +145,7 @@ open RetrieverExample.xcodeproj  # 选真机运行（自动签名，team R22CUP2
 swift build && swift build -c release
 swift test        # golden 向量、跨语言信封校验（需仓库根 npm install）、真杀进程（RetrieverKillHelper）、两个适配器
 ```
+
+## 脱敏（宿主建议）
+
+日志在落盘前经过 `Options.redact: (LogLine) -> LogLine?`（返回 nil = 丢弃该行）。宿主自己的 URL、交易号、用户标识往往会出现在第三方 SDK 的错误文本里，建议在这里统一掩码，例如把 `/v1/subscribers/<id>` 与 `tx=<id>` 替换成 `<masked>`（bff iOS 的做法）。Retriever 服务端不做二次脱敏，落盘的就是上传的。

@@ -19,6 +19,8 @@ let package = Package(
     targets: [
         .target(
             name: "Retriever",
+            // 隐私清单随包分发（Apple：Swift 包资源默认位置 Sources/<target>/PrivacyInfo.xcprivacy）
+            resources: [.copy("PrivacyInfo.xcprivacy")],
             linkerSettings: [.linkedLibrary("z")]
         ),
         .target(
