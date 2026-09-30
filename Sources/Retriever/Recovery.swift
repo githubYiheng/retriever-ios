@@ -86,6 +86,10 @@ extension Engine {
             if let t = f.tornSeq { maxSeq = max(maxSeq, t) }
             if let t = f.tornOseq, t > 0 { maxOseq = max(maxOseq, t) }
         }
+        // 盘上最大值在旧段被驱逐后偏低：并入已物化高水位（已含出站箱）与本会话墓碑，
+        // 否则合成行与已上传的 oseq 撞号、永不上传，终态 last_oseq 低报
+        let tombMax = existingDrops.filter { $0.sessionId == sid }.map(\.oseqTo).max() ?? 0
+        maxOseq = max(maxOseq, cursor.extractedThroughOseq, tombMax)
         maxSeq = max(maxSeq, cursor.ctxThroughSeq)
 
         if cursor.closedMs == nil {

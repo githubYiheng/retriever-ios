@@ -93,6 +93,44 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(t.batchRequests.count, 3)
     }
 
+    /// 拉配置在途期间调度器不空转（发版前审查 A2）：发起即记尝试时刻；任何候选已到期时定时器也至少睡 1 s。
+    func testConfigInFlightDoesNotSpinScheduler() async throws {
+        // 发起即记：configRequest() 构造出请求后，轮询立即不到期
+        do {
+            let h = Harness()
+            await h.settle()
+            let (built, due) = await h.work { e -> (Bool, Bool) in
+                e.lastConfigFetchMono = nil
+                let r = e.configRequest()
+                return (r != nil, e.configPollDue(nowMono: e.clock.monoMs()))
+            }
+            XCTAssertTrue(built)
+            XCTAssertFalse(due)
+        }
+        // 地板（纯函数）
+        XCTAssertEqual(RetrieverClient.timerDelayMs(next: 100, now: 5_000), ClientConstants.schedulerMinDelayMs)
+        XCTAssertEqual(RetrieverClient.timerDelayMs(next: 5_000, now: 5_000), 1_000)
+        XCTAssertEqual(RetrieverClient.timerDelayMs(next: 65_000, now: 5_000), 60_000)
+
+        // 启动时的配置请求挂起（在途）
+        let t = FakeTransport()
+        t.configHang = true
+        let h = Harness(transport: t)
+        await waitFor { t.hangingCount == 1 && !h.clock.timerSleepRequests.isEmpty }
+        XCTAssertEqual(t.hangingCount, 1)
+        XCTAssertEqual(h.clock.timerSleepRequests, [Int64(Limits.configPollIntervalS) * 1000], "在途期间下一次唤醒在 30 min 后，不在过去")
+        // 在途超过 30 min（真实里有请求超时，这里人为挂着）：轮询候选落到过去，定时器仍睡满地板
+        h.clock.advance(Int64(Limits.configPollIntervalS) * 1000 + 60_000)
+        let c = h.client
+        await c.onWork { c.tick() }
+        await waitFor { h.clock.timerSleepRequests.count >= 2 }
+        XCTAssertEqual(h.clock.timerSleepRequests.dropFirst().first, ClientConstants.schedulerMinDelayMs)
+        XCTAssertTrue(h.clock.timerSleepRequests.allSatisfy { $0 >= ClientConstants.schedulerMinDelayMs })
+        XCTAssertEqual(t.configRequests.count, 1, "在途时不重复拉")
+        t.cancelAll()
+        await h.settle()
+    }
+
     /// 不看网络类型（ADR 0009）：backfill 批与其它批走同一套队列 / 退避规则，生成后照常上传。
     func testBackfillUploadsLikeOtherBatches() async throws {
         let t = FakeTransport()

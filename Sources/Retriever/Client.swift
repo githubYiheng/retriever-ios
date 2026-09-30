@@ -562,11 +562,16 @@ public final class RetrieverClient: PlatformEventSink, @unchecked Sendable {
             guard let next else { return }
             let clock = self.clock
             c.timerTask = Task.detached { [weak self] in
-                do { try await clock.timerSleep(ms: max(0, next - nowMono)) } catch { return }
+                do { try await clock.timerSleep(ms: RetrieverClient.timerDelayMs(next: next, now: nowMono)) } catch { return }
                 guard let self else { return }
                 self.work.async { self.tick() }
             }
         }
+    }
+
+    /// 定时器睡多久：候选已到期（≤ now）也至少等 schedulerMinDelayMs，任何候选都造不成 0 ms 自旋。
+    static func timerDelayMs(next: Int64, now: Int64) -> Int64 {
+        max(next - now, ClientConstants.schedulerMinDelayMs)
     }
 
     func tick() {
@@ -629,6 +634,9 @@ public final class RetrieverClient: PlatformEventSink, @unchecked Sendable {
     }
 
     public func setFlushWindowForTesting(_ ms: Int64) { ctl.with { $0.flushWindowMs = ms } }
+
+    /// 最近一轮排空停下的原因（`nextSend` 的 stop reason）。
+    public var debugLastStopReason: String { ctl.with { $0.lastStop.reason } }
 
     public var debugCounters: (seq: Int64, oseq: Int64) {
         let s = writer.snapshot

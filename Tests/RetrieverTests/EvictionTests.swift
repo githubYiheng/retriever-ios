@@ -83,6 +83,49 @@ final class EvictionTests: XCTestCase {
         XCTAssertEqual(int((results.first?["stats"] as? [String: Any])?["dropsN"]), 1 + 1 + 1 + 1)
     }
 
+    /// 低磁盘（ADR 0010）：余量额度只收紧 RETAINED 段与 p2；刚物化的 error 批留着并照常上传（修复前：上传前被驱逐、0 请求）。
+    func testLowDiskKeepsObligationBatchAndUploads() async throws {
+        let h = Harness()
+        await h.settle()
+        h.client.log(.debug, "retained")
+        await h.seal()
+        h.platform.available = 10 * 1024 * 1024
+        h.client.log(.info, "ctx")
+        h.client.log(.error, "boom")
+        await h.sealAndDrain(.error)
+        XCTAssertEqual(h.transport.batchRequests.count, 1)
+        let env = try XCTUnwrap(decodeEnvelope(XCTUnwrap(h.transport.batchRequests.first?.body)))
+        XCTAssertTrue(lines(of: env).contains { $0["msg"] as? String == "boom" })
+        XCTAssertTrue(lines(of: env).contains { $0["ctx"] as? Bool == true }, "先物化（带 ctx）再驱逐")
+        XCTAssertEqual(h.outboxFiles(), [])
+        let sealed = ((try? FileManager.default.contentsOfDirectory(atPath: h.sessionDir().path)) ?? []).filter { $0.hasSuffix(".sealed") }
+        XCTAssertEqual(sealed, [], "RETAINED 段按余量额度驱逐")
+        XCTAssertEqual(h.readJSONL("drops.jsonl").count, 0, "无义务，不记墓碑")
+    }
+
+    /// 低磁盘：RETAINED 段与 p2 被驱逐（p2 记 backfill_evicted），q / p1 / p0 只受硬上限约束；
+    /// 超过 local_cap_bytes 时仍按 q → p1 → p0 驱逐并记墓碑。
+    func testLowDiskEvictsOnlyNonObligationThenHardCapOrder() async throws {
+        let h = await prepare()
+        let dir = h.sessionDir()
+        let sealedSegs = { ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []).filter { $0.hasSuffix(".sealed") } }
+        XCTAssertEqual(sealedSegs().count, 6)
+        h.platform.available = 10 * 1024 * 1024
+        await h.work { $0.evictIfNeeded() }
+        XCTAssertEqual(sealedSegs(), [])
+        XCTAssertEqual(h.outboxFiles().map { String($0.prefix(2)) }.sorted(), ["p0", "p1", "q-"])
+        XCTAssertEqual(h.readJSONL("drops.jsonl").map { $0["reason"] as? String }, ["backfill_evicted"])
+        await h.work { e in
+            e.effective.config.localCapBytes = 0
+            e.evictIfNeeded()
+        }
+        XCTAssertEqual(h.outboxFiles(), [])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: h.client.debugOpenSegmentPath!))
+        let drops = h.readJSONL("drops.jsonl")
+        XCTAssertEqual(drops.map { $0["reason"] as? String }, ["backfill_evicted", "quarantine_evicted", "buffer_overflow", "buffer_overflow"])
+        XCTAssertEqual(drops.map { int($0["oseq_from"]) }, [0, 1, 2, 3])
+    }
+
     func testSegmentsOlderThanSevenDaysDeletedUnconditionally() async throws {
         let h = Harness(key: "")
         await h.settle()

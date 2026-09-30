@@ -16,11 +16,13 @@ extension Engine {
     }
 
     /// 选下一批：p0 > p1 > p2，同级 created_ms 升序（失败过的批让到后面，避免头阻塞）；单在途；相邻请求 ≥ 2 s；
-    /// 全局或对应类别未暂停。
+    /// 全局或对应类别未暂停。读不出的批跳过、试下一个（不递归：出站箱每轮都会把它重新载回）。
     func nextSend() -> SendStep {
         let nowMono = clock.monoMs()
         if key.isEmpty { return .stop(reason: "not_configured", wakeMono: nil) }
         if !enabled { return .stop(reason: "disabled", wakeMono: nil) }
+        // 未 bootstrap（install.json 读改写失败）：不碰磁盘，等 retryBootstrap
+        guard let inst = install else { return .stop(reason: "not_bootstrapped", wakeMono: nil) }
         if !effective.config.uploadEnabled { return .stop(reason: "upload_disabled", wakeMono: nil) }
         let pauseActive = backoff.pausedUntilMono > nowMono
         if pauseActive && backoff.pausedCategories.contains("all") {
@@ -45,23 +47,24 @@ extension Engine {
             return (f0, $0.prio, $0.createdMs, $0.name) < (f1, $1.prio, $1.createdMs, $1.name)
         }
         // candidates 非空时 eligible 为空只可能是类别暂停
-        guard let pick = eligible.first else { return .stop(reason: "paused", wakeMono: backoff.pausedUntilMono) }
+        if eligible.isEmpty { return .stop(reason: "paused", wakeMono: backoff.pausedUntilMono) }
         guard acquireUploadLock() else { return .stop(reason: "locked", wakeMono: nowMono + 60_000) }
-        guard let body = FS.read(outboxDir.appendingPathComponent(pick.name)), let inst = install else {
-            metas.removeValue(forKey: pick.name)
-            return nextSend()
+        for pick in eligible {
+            // 读不出（fd 耗尽、保护类异常等）：跳过，不删、不隔离、不计 fail；留在出站箱下一轮再试，最终由容量驱逐兜底
+            guard let body = FS.read(outboxDir.appendingPathComponent(pick.name)) else { continue }
+            let req = HTTPRequest(method: "POST", url: baseURL.appendingPathComponent("v1/batches"), headers: [
+                "Authorization": "Bearer \(key)",
+                "Content-Type": "application/json",
+                "Content-Encoding": "gzip",
+                "X-Rtv-Install": inst.installId,
+                "X-Rtv-Sent-Ms": String(clock.wallMs()),
+                "X-Rtv-Sdk": sdkHeader,
+            ], body: Data(body))
+            inFlight = pick.name
+            lastRequestMono = nowMono
+            return .send(name: pick.name, request: req)
         }
-        let req = HTTPRequest(method: "POST", url: baseURL.appendingPathComponent("v1/batches"), headers: [
-            "Authorization": "Bearer \(key)",
-            "Content-Type": "application/json",
-            "Content-Encoding": "gzip",
-            "X-Rtv-Install": inst.installId,
-            "X-Rtv-Sent-Ms": String(clock.wallMs()),
-            "X-Rtv-Sdk": sdkHeader,
-        ], body: Data(body))
-        inFlight = pick.name
-        lastRequestMono = nowMono
-        return .send(name: pick.name, request: req)
+        return .stop(reason: "unreadable", wakeMono: nil)
     }
 
     // MARK: 上传锁（多进程：只有拿到 upload.lock 的一方排空；进后台前释放）
@@ -108,7 +111,13 @@ extension Engine {
                 failure(name, retryAfterS: nil, reason: "echo_mismatch", countFail: true)
             }
         case 401, 403:
-            authPause(reason: (body?["reason"] as? String) ?? String(r.status))
+            // 只认服务端的明确表态（JSON 对象且 reason 是字符串，未知值同样算）；边缘 / WAF / captive portal 替服务端回的
+            // 401 / 403（HTML、空体、无 reason）按「其它」：全局退避 + 计毒批（ADR 0011）
+            if let reason = body?["reason"] as? String {
+                authPause(reason: reason)
+            } else {
+                failure(name, retryAfterS: nil, reason: "http_\(r.status)", countFail: true)
+            }
         case 413:
             split413(name)
         case 429:
@@ -180,7 +189,13 @@ extension Engine {
         backoff.nextAtMonoMs = 0
         backoff.nextAtWallMs = 0
         backoff.lastAckMs = nowWall
-        if !backoff.pausedCategories.contains("all") { backoff.reason = "" }
+        // 任何 2xx 都复位暂停倍增状态（ADR 0011）：已到期的暂停一并清掉；仍在生效的类别暂停（info / backfill）不动
+        backoff.reason = ""
+        if backoff.pausedUntilMono <= clock.monoMs() {
+            backoff.pausedCategories = []
+            backoff.pausedUntilMono = 0
+            backoff.pausedUntilMs = 0
+        }
         persistBackoff()
     }
 
@@ -203,7 +218,7 @@ extension Engine {
         if f.count >= Limits.poisonConsecutiveFails && f.otherSuccess { quarantine(name) }
     }
 
-    /// 401 / 403：全局暂停 1 h 起倍增到 24 h；照常写本地、照常拉配置；不删任何文件。
+    /// 带 reason 的 401 / 403：全局暂停 1 h 起倍增到 24 h（2xx 确认后复位）；照常写本地、照常拉配置；不删任何文件。
     private func authPause(reason: String) {
         let prev: Int64? = backoff.reason.hasPrefix("auth:") ? Int64(backoff.reason.dropFirst(5)) : nil
         let dur = prev.map { min($0 * 2, Limits.pause401MaxMs) } ?? Limits.pause401BaseMs
@@ -257,6 +272,8 @@ extension Engine {
             // 值一律 percent-encode（ASCII 字母数字以外全部编码，服务端 decodeURIComponent）
             h["X-Rtv-User"] = u.addingPercentEncoding(withAllowedCharacters: Engine.asciiAlnum) ?? ""
         }
+        // 发起即记尝试时刻（响应回来再记一次）：在途期间轮询候选不会停在过去，调度器不空转
+        lastConfigFetchMono = clock.monoMs()
         return HTTPRequest(method: "GET", url: baseURL.appendingPathComponent("v1/config"), headers: h, body: nil)
     }
 

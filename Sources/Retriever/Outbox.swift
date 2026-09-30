@@ -219,9 +219,10 @@ extension Engine {
 
     // MARK: 驱逐（§3.8，宪法 R-5）
 
-    /// 总量 = 各会话段 + 出站箱；上限 = min(local_cap_bytes, 本方已占 + 可用空间 − 64 MB 余量)。
-    /// 顺序：RETAINED 段最旧优先（无义务不记墓碑；> 7 d 无条件删）→ p2（backfill_evicted）→ q（quarantine_evicted）
-    /// → p1（buffer_overflow）→ p0（buffer_overflow）。当前 OPEN 段永不驱逐。
+    /// 总量 = 各会话段 + 出站箱。两个额度（ADR 0010）：硬上限 = local_cap_bytes，是驱逐义务批的唯一依据；
+    /// 磁盘余量额度 = min(硬上限, max(0, 本方已占 + 可用空间 − 64 MB))（可用空间未知时 = 硬上限），只约束无义务类。
+    /// 顺序：RETAINED 段最旧优先（无义务不记墓碑；> 7 d 无条件删）→ p2（backfill_evicted）【以上按余量额度】
+    /// → q（quarantine_evicted）→ p1（buffer_overflow）→ p0（buffer_overflow）【按硬上限】。当前 OPEN 段永不驱逐。
     func evictIfNeeded() {
         let nowWall = clock.wallMs()
         struct Seg { var url: URL; var size: Int64; var mtime: Int64; var segNo: Int }
@@ -243,9 +244,11 @@ extension Engine {
         reconcileOutbox()
         for m in metas.values { total += m.bytes }
 
-        var cap = Int64(effective.config.localCapBytes)
+        let hardCap = Int64(effective.config.localCapBytes)
+        var softCap = hardCap
         if let avail = platform.availableBytes(at: root) {
-            cap = min(cap, max(0, total + avail - ClientConstants.diskReserveBytes))
+            // 磁盘紧张只让出可再生的部分：义务批不因余量在上传前消失（否则墓碑与会话终态也永远送不出去）
+            softCap = min(hardCap, max(0, total + avail - ClientConstants.diskReserveBytes))
         }
         sealed.sort { ($0.mtime, $0.segNo) < ($1.mtime, $1.segNo) }
         var tombs: [DropEntry] = []
@@ -259,7 +262,7 @@ extension Engine {
                 remaining.append(s)
             }
         }
-        if total > cap, let cur = current, (cur.sealed.last?.lastOseq ?? 0) > cur.cursor.extractedThroughOseq {
+        if total > softCap, let cur = current, (cur.sealed.last?.lastOseq ?? 0) > cur.cursor.extractedThroughOseq {
             // daily cap 推迟的义务行先物化，保证 RETAINED 段不带义务
             materialize(cur, targetOseq: cur.sealed.map(\.lastOseq).max() ?? 0,
                         targetSeq: cur.sealed.last?.lastSeq ?? 0, noCtx: false, ignoreCap: true)
@@ -267,12 +270,14 @@ extension Engine {
             total = remaining.reduce(0) { $0 + $1.size } + metas.values.reduce(0) { $0 + $1.bytes }
                 + (FS.size(writer.currentSegmentURL ?? URL(fileURLWithPath: "/nonexistent")) ?? 0)
         }
-        for s in remaining where total > cap {
+        for s in remaining where total > softCap {
             total -= s.size
             evictSegment(s.url, now: nowWall, tombs: &tombs)
         }
-        if total > cap {
+        if total > softCap {
             for prio in [2, 3, 1, 0] {
+                // p2 无义务，按余量额度；q / p1 / p0 只受硬上限约束
+                let cap = prio == 2 ? softCap : hardCap
                 let batch = metas.values.filter { $0.prio == prio && $0.name != inFlight }
                     .sorted { ($0.createdMs, $0.name) < ($1.createdMs, $1.name) }
                 for m in batch where total > cap {
@@ -299,6 +304,12 @@ extension Engine {
                 others.removeValue(forKey: s.meta.sessionId)
                 FS.remove(s.dir)
                 return
+            }
+            // seq 高水位：被驱逐段的行不可能再作 ctx，记进 ctx 游标语义正确、不改磁盘格式，
+            // 恢复时 maxSeq 取它，合成行的 seq 不会回退到已用过的号
+            if info.lastSeq > s.cursor.ctxThroughSeq {
+                s.cursor.ctxThroughSeq = info.lastSeq
+                writeCursor(s)
             }
             break
         }

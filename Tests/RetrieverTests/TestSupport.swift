@@ -48,8 +48,14 @@ final class FakeClock: Clock, @unchecked Sendable {
     /// 流程内等待：直接推进假时间。
     func sleep(ms: Int64) async { advance(max(ms, 0)) }
 
+    private var timerSleeps: [Int64] = []
+
+    /// 调度器请求过的睡眠时长（断言调度地板用）。
+    var timerSleepRequests: [Int64] { lock.lock(); defer { lock.unlock() }; return timerSleeps }
+
     /// 调度器睡眠：永不自己醒（测试手动 tick），被取消时抛错。
     func timerSleep(ms: Int64) async throws {
+        lock.withLock { timerSleeps.append(ms) }
         while true {
             try Task.checkCancellation()
             try await Task.sleep(nanoseconds: 50_000_000)
@@ -64,6 +70,7 @@ final class FakeTransport: Transport, @unchecked Sendable {
         case echo                                   // 200 回显本批 batch_id
         case echoWrong                              // 200 回显别的 batch_id
         case status(Int, [String: Any]?, [String: String])
+        case raw(Int, Data, [String: String])       // 任意响应体（HTML 等）
         case network                                // 网络错误
         case hang                                   // 挂起直到 cancelAll
     }
@@ -75,6 +82,8 @@ final class FakeTransport: Transport, @unchecked Sendable {
     var responder: ((String) -> Reply?)?
     var configBody: [String: Any]?
     var configEtag = "etag-0"
+    /// 配置请求挂起直到 cancelAll（拉配置在途）。
+    var configHang = false
     private(set) var requests: [HTTPRequest] = []
     private(set) var cancelCount = 0
     private var hanging: [CheckedContinuation<HTTPResponse?, Never>] = []
@@ -96,7 +105,7 @@ final class FakeTransport: Transport, @unchecked Sendable {
     private func decide(_ request: HTTPRequest) -> (Reply?, [String: Any]?, String, String?) {
         lock.withLock {
             requests.append(request)
-            if request.url.path.hasSuffix("/v1/config") { return (nil, configBody, configEtag, nil) }
+            if request.url.path.hasSuffix("/v1/config") { return (configHang ? .hang : nil, configBody, configEtag, nil) }
             let bid = FakeTransport.batchId(request.body)
             var reply: Reply
             if let r = responder, let x = r(bid ?? "") { reply = x }
@@ -119,6 +128,8 @@ final class FakeTransport: Transport, @unchecked Sendable {
             return HTTPResponse(status: 200, body: json(["batch_id": "00000000-0000-4000-8000-000000000000", "status": "stored", "config_etag": etag]))
         case .status(let code, let body, let headers):
             return HTTPResponse(status: code, headers: headers, body: body.map(json) ?? Data())
+        case .raw(let code, let body, let headers):
+            return HTTPResponse(status: code, headers: headers, body: body)
         case .network:
             return nil
         case .hang:
@@ -268,6 +279,15 @@ final class Harness {
         for i in 0..<count {
             client.log(level, count > 1 ? "\(msg) \(i)" + String(repeating: "p", count: pad) : msg + String(repeating: "p", count: pad))
         }
+    }
+}
+
+/// 等后台任务（detached Task）达成条件：最长约 1 s 真实时间，不推进假时钟。
+func waitFor(_ cond: () -> Bool) async {
+    var n = 0
+    while !cond() && n < 500 {
+        try? await Task.sleep(nanoseconds: 2_000_000)
+        n += 1
     }
 }
 

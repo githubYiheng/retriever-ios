@@ -92,11 +92,106 @@ final class QueueTests: XCTestCase {
                 e.backoff.pausedUntilMono = 0
                 e.backoff.pausedCategories = []
             }
-            h.transport.setScript([.status(401, nil, [:])])
+            h.transport.setScript([.status(401, ["reason": "key_invalid"], [:])])
             await h.tick(advance: Limits.minRequestSpacingMs)
         }
         (b, now) = await h.work { ($0.backoff, $0.clock.monoMs()) }
         XCTAssertEqual(b.pausedUntilMono - now, Limits.pause401MaxMs)
+    }
+
+    /// 非服务端表态的 401 / 403（空体、HTML、无 reason / reason 非字符串的 JSON）按「其它」：全局退避 + 计 fail，不暂停（ADR 0011）。
+    func testUnauthorizedWithoutReasonIsOrdinaryBackoff() async throws {
+        let cases: [(FakeTransport.Reply, String)] = [
+            (.status(403, nil, [:]), "http_403"),
+            (.raw(401, Data("<html><body>Access denied | Cloudflare</body></html>".utf8), ["content-type": "text/html"]), "http_401"),
+            (.status(403, ["error": "x"], [:]), "http_403"),
+            (.status(401, ["reason": 1], [:]), "http_401"),
+        ]
+        for (reply, reason) in cases {
+            let h = Harness()
+            await h.settle()
+            h.transport.setScript([reply])
+            h.client.log(.warn, "w")
+            await h.sealAndDrain()
+            XCTAssertEqual(h.transport.batchRequests.count, 1)
+            let (b, now, fails) = await h.work { ($0.backoff, $0.clock.monoMs(), $0.fails.values.map(\.count)) }
+            XCTAssertEqual(b.reason, reason)
+            XCTAssertEqual(b.pausedCategories, [], reason)
+            XCTAssertEqual(b.pausedUntilMono, 0, reason)
+            XCTAssertEqual(b.attempt, 1)
+            XCTAssertGreaterThanOrEqual(b.nextAtMonoMs - now, 800)
+            XCTAssertLessThanOrEqual(b.nextAtMonoMs - now, 1200)
+            XCTAssertEqual(fails, [1], "计毒批失败")
+            XCTAssertEqual(h.outboxFiles().count, 1, "不删")
+            // 约 1 s 退避（相邻请求另有 2 s 间隔）后重试并确认
+            await h.tick(advance: Limits.minRequestSpacingMs)
+            XCTAssertEqual(h.transport.batchRequests.count, 2, reason)
+            XCTAssertEqual(h.outboxFiles(), [])
+        }
+    }
+
+    /// 带 reason 的 401 / 403 仍暂停 1 h → 2 h；暂停到期后一次 2xx 确认复位倍增状态，再遇（未知 reason 的）403 从 1 h 起步。
+    func testAuthPauseDoublingResetsAfterAck() async throws {
+        let h = Harness()
+        await h.settle()
+        h.transport.setScript([.status(401, ["reason": "key_invalid"], [:]), .status(401, ["reason": "key_invalid"], [:]),
+                               .echo, .status(403, ["reason": "some_future_reason"], [:])])
+        h.client.log(.warn, "w")
+        await h.sealAndDrain()
+        var (b, now) = await h.work { ($0.backoff, $0.clock.monoMs()) }
+        XCTAssertEqual(b.pausedCategories, ["all"])
+        XCTAssertEqual(b.pausedUntilMono - now, 3_600_000)
+        await h.tick(advance: 3_600_000)
+        (b, now) = await h.work { ($0.backoff, $0.clock.monoMs()) }
+        XCTAssertEqual(b.pausedUntilMono - now, 7_200_000)
+        await h.tick(advance: 7_200_000)
+        XCTAssertEqual(h.transport.batchRequests.count, 3)
+        XCTAssertEqual(h.outboxFiles(), [])
+        (b, now) = await h.work { ($0.backoff, $0.clock.monoMs()) }
+        XCTAssertEqual(b.reason, "")
+        XCTAssertEqual(b.pausedCategories, [])
+        XCTAssertEqual(b.pausedUntilMono, 0)
+        XCTAssertEqual(b.pausedUntilMs, 0)
+        let bj = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(contentsOf: h.root.appendingPathComponent("backoff.json"))) as? [String: Any])
+        XCTAssertEqual(bj["reason"] as? String, "")
+        XCTAssertEqual(bj["paused_categories"] as? [String], [])
+        h.clock.advance(Limits.minRequestSpacingMs)
+        h.client.log(.warn, "w2")
+        await h.sealAndDrain()
+        XCTAssertEqual(h.transport.batchRequests.count, 4)
+        (b, now) = await h.work { ($0.backoff, $0.clock.monoMs()) }
+        XCTAssertEqual(b.pausedCategories, ["all"])
+        XCTAssertEqual(b.pausedUntilMono - now, 3_600_000, "确认后从 1 h 起步")
+    }
+
+    /// 读不出的批跳过、试下一个（不删、不隔离、不计 fail）；只剩读不出的 → 停在 unreadable；可读后照常发（发版前审查 A1）。
+    func testUnreadableBatchIsSkippedNotRecursed() async throws {
+        try XCTSkipIf(getuid() == 0, "root 无视文件权限")
+        let h = Harness(key: "")
+        await h.settle()
+        h.client.log(.warn, "older")
+        await h.seal()
+        h.clock.advance(10)
+        h.client.log(.warn, "newer")
+        await h.seal()
+        let names = h.outboxFiles()
+        XCTAssertEqual(names.count, 2)
+        let bad = h.outbox.appendingPathComponent(names[0])
+        XCTAssertEqual(chmod(bad.path, 0), 0)
+        await h.enableUpload()
+        XCTAssertEqual(h.transport.batchRequests.count, 1)
+        XCTAssertEqual(lines(of: env(try XCTUnwrap(h.transport.batchRequests.first))).first?["msg"] as? String, "newer")
+        XCTAssertEqual(h.outboxFiles(), [names[0]], "读不出的留在出站箱")
+        await h.tick(advance: Limits.minRequestSpacingMs)
+        XCTAssertEqual(h.client.debugLastStopReason, "unreadable")
+        XCTAssertEqual(h.transport.batchRequests.count, 1)
+        let fails = await h.work { $0.fails.count }
+        XCTAssertEqual(fails, 0, "不计 fail")
+        XCTAssertEqual(h.outboxFiles(), [names[0]], "不删、不隔离")
+        XCTAssertEqual(chmod(bad.path, 0o600), 0)
+        await h.tick(advance: Limits.minRequestSpacingMs)
+        XCTAssertEqual(h.transport.batchRequests.count, 2)
+        XCTAssertEqual(h.outboxFiles(), [])
     }
 
     func testTooLargeSplitsIntoContiguousHalves() async throws {

@@ -49,6 +49,7 @@ final class Engine: @unchecked Sendable {
 
     var configCache: ConfigCache?
     var effective: EffectiveConfig
+    /// 上次拉配置的**尝试**时刻（单调）：请求发起时记一次，响应回来再记一次。
     var lastConfigFetchMono: Int64?
 
     var backoff = BackoffState()
@@ -107,13 +108,13 @@ final class Engine: @unchecked Sendable {
 
     // MARK: 启动（同步：log() 在 init 返回后立即可用）
 
-    /// 建目录、install.json（首次生成 O_EXCL 临时文件 → fsync → rename，失败方重读）、计数器 +1、新会话。
+    /// 建目录、install.json（首次生成 O_EXCL 临时文件 → fsync → rename，失败方重读；损坏则重建并留痕）、计数器 +1、新会话。
     @discardableResult
     func bootstrap() -> Bool {
         guard FS.ensureDir(root), FS.ensureDir(procDir), FS.ensureDir(outboxDir) else { return false }
         FS.excludeFromBackup(root)
-        let result: (InstallInfo, Int64)? = FS.withDirLock(root) { bumpInstallLocked() }
-        guard let (inst, sessionNo) = result else { return false }
+        let result: (InstallInfo, Int64, Bool)? = FS.withDirLock(root) { bumpInstallLocked() }
+        guard let (inst, sessionNo, reset) = result else { return false }
         install = inst
         let now = clock.wallMs()
         let sid = IDs.newV4()
@@ -128,6 +129,12 @@ final class Engine: @unchecked Sendable {
         writeCursor(rec)
         writer.startSession(dir: dir, sessionId: sid)
         loadPersistentState()
+        if reset {
+            // install_id 换了：新会话里留一条合成行（同 rtv.flush 的合成机制），排障时看得见
+            let enc = LineEncoder.encode(LogLine(ts: now, level: .warn, msg: "install.json unreadable; install_id regenerated",
+                                                 tag: "rtv.install_reset"), synthetic: true)
+            _ = writer.append(level: .warn, body: enc.body)
+        }
         return true
     }
 
@@ -150,20 +157,34 @@ final class Engine: @unchecked Sendable {
         if sessionLockFd >= 0 { flock(sessionLockFd, LOCK_UN); close(sessionLockFd) }
     }
 
-    private func bumpInstallLocked() -> (InstallInfo, Int64)? {
+    /// 返回 (install, session_no, 是否因损坏而重建)。
+    private func bumpInstallLocked() -> (InstallInfo, Int64, Bool)? {
         var inst: InstallInfo
-        if let b = FS.read(installURL), let i = InstallInfo.decode(b) {
-            inst = i
+        var reset = false
+        if let b = FS.read(installURL) {
+            if let i = InstallInfo.decode(b) {
+                inst = i
+            } else {
+                // 读到了（含 0 字节）却解析不了 = 损坏：原子重建，否则此后每次 bootstrap 都失败、SDK 永久静默。
+                // 读不全（大小对不上）不算损坏，按读失败处理
+                guard Int64(b.count) == FS.size(installURL), let rebuilt = createInstallLocked(replacing: true) else { return nil }
+                inst = rebuilt
+                reset = true
+            }
         } else {
-            guard let created = createInstallLocked() else { return nil }
+            // 读不到：不存在则创建；存在但读不了（首次解锁前 / 权限）则本次失败、稍后 retryBootstrap——
+            // 绝不在这里重建，否则首次解锁前启动会换掉 install_id
+            guard let created = createInstallLocked(replacing: false) else { return nil }
             inst = created
         }
         inst.sessionCounter += 1
         guard FS.writeAtomic(installURL, inst.encode()) else { return nil }
-        return (inst, inst.sessionCounter)
+        return (inst, inst.sessionCounter, reset)
     }
 
-    private func createInstallLocked() -> InstallInfo? {
+    /// 新 install（新 install_id、计数器 0）：O_EXCL 临时文件 → fsync → rename。`replacing == false` 时目标已存在就放弃
+    /// （并发的另一方已写）；`replacing == true` 覆盖损坏的 install.json。调用方持有 root 目录锁。
+    private func createInstallLocked(replacing: Bool) -> InstallInfo? {
         let info = InstallInfo(installId: IDs.newV4(), sessionCounter: 0, createdMs: clock.wallMs())
         let tmp = root.appendingPathComponent(".install.json.tmp-\(getpid())")
         unlink(tmp.path)
@@ -173,7 +194,7 @@ final class Engine: @unchecked Sendable {
             let bytes = info.encode()
             let ok = bytes.withUnsafeBytes { FS.writeAll(fd, $0) } && fsync(fd) == 0
             close(fd)
-            if ok && !FS.exists(installURL) && rename(tmp.path, installURL.path) == 0 {
+            if ok && (replacing || !FS.exists(installURL)) && rename(tmp.path, installURL.path) == 0 {
                 FS.markFile(installURL)
             } else {
                 unlink(tmp.path)

@@ -64,8 +64,11 @@ final class EnvelopeCrossLangTests: XCTestCase {
             a.client.log(.info, "before crash")
             a.client.log(.warn, "a warn")
             let aSid = a.client.writer.currentSessionId
+            // 墓碑记在另一个（更早的）会话名下：墓碑随下一个 primary 批上报、不限会话；记在 a 名下的话 oseq_to 会抬高
+            // a 的恢复高水位（0.1.4），a 的恢复批会在缺口处切开，extras 与合成行就不在同一批里了
+            let otherSid = IDs.newV4()
             _ = await a.work { e in
-                e.appendDrops([DropEntry(sessionId: aSid, oseqFrom: 7, oseqTo: 9, n: 3, reason: "buffer_overflow", atMs: 1, lastAckAgeMs: 86_400_000)])
+                e.appendDrops([DropEntry(sessionId: otherSid, oseqFrom: 7, oseqTo: 9, n: 3, reason: "buffer_overflow", atMs: 1, lastAckAgeMs: 86_400_000)])
             }
             a.client.simulateCrash()
             let b = Harness(root: root, key: "")   // 同一 root 再启动：a 的会话成了孤儿（last_state = fg）

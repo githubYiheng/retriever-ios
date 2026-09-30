@@ -132,6 +132,103 @@ final class KillTests: XCTestCase {
         for r in results { XCTAssertEqual(r["ok"] as? Bool, true, "\(r)") }
     }
 
+    /// 恢复 oseq 高水位（发版前审查 A5）：义务行已物化并确认、RETAINED 段已驱逐、OPEN 段只有非义务行、last_state = fg，
+    /// 崩溃重启 → 合成 unclean_exit 接着已物化的 oseq 编号、物化成批，终态 last_oseq 同值（修复前：撞号 oseq 1、永不上传）。
+    func testRecoveryAfterEvictionKeepsOseqHighWater() async throws {
+        let root = makeTempDir("rtv-hw")
+        let a = Harness(root: root)
+        await a.settle()
+        for i in 1...3 { a.client.log(.warn, "w\(i)") }
+        a.client.log(.debug, "d")
+        await a.sealAndDrain()
+        XCTAssertEqual(a.transport.batchRequests.count, 1)
+        XCTAssertEqual(a.outboxFiles(), [])
+        let (extracted, evictedLastSeq) = await a.work { e in (e.current!.cursor.extractedThroughOseq, e.current!.sealed.last!.lastSeq) }
+        XCTAssertEqual(extracted, 3)
+        let aSid = a.client.writer.currentSessionId
+        let dir = a.sessionDir()
+        // 低磁盘：RETAINED 段按余量额度驱逐（ADR 0010）
+        a.platform.available = 10 * 1024 * 1024
+        await a.work { $0.evictIfNeeded() }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("seg-000001.sealed").path))
+        a.client.log(.info, "after eviction")
+        a.client.log(.debug, "more")
+        a.client.simulateCrash()
+
+        let b = Harness(root: root, key: "")   // 不上传：批留在出站箱里检查
+        await b.settle()
+        let synth = try XCTUnwrap(allLines(dir).last)
+        XCTAssertEqual(synth["tag"] as? String, "rtv.unclean_exit")
+        XCTAssertEqual(int(synth["oseq"]), extracted + 1)
+        XCTAssertGreaterThan(int(synth["seq"]), evictedLastSeq)
+        let env = try XCTUnwrap(b.envelopes().first { $0.1["session_id"] as? String == aSid }?.1)
+        XCTAssertEqual(int(env["oseq_from"]), extracted + 1)
+        XCTAssertEqual(int(env["oseq_to"]), extracted + 1)
+        let closed = b.readJSONL("sessions.jsonl").filter { $0["session_id"] as? String == aSid }
+        XCTAssertEqual(closed.count, 1)
+        XCTAssertEqual(closed.first?["exit"] as? String, "unclean_fg")
+        XCTAssertEqual(int(closed.first?["last_oseq"]), extracted + 1)
+        XCTAssertEqual(int(closed.first?["last_seq"]), int(synth["seq"]))
+        let results = try runValidator([env])
+        XCTAssertEqual(results.first?["ok"] as? Bool, true, "\(results)")
+    }
+
+    /// 恢复 seq 高水位：驱逐自己会话的段时把它的 lastSeq 并入 ctx 游标；OPEN 段为空时合成行 seq 也接着编（修复前：seq 1 撞号）。
+    func testRecoveryAfterEvictionKeepsSeqHighWater() async throws {
+        let root = makeTempDir("rtv-hw")
+        let a = Harness(root: root)
+        await a.settle()
+        a.client.log(.warn, "w")
+        for i in 0..<5 { a.client.log(.debug, "d\(i)") }
+        await a.sealAndDrain()
+        XCTAssertEqual(a.outboxFiles(), [])
+        let dir = a.sessionDir()
+        let aSid = a.client.writer.currentSessionId
+        a.platform.available = 10 * 1024 * 1024
+        await a.work { $0.evictIfNeeded() }
+        let cursor = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(contentsOf: dir.appendingPathComponent("cursor.json"))) as? [String: Any])
+        XCTAssertEqual(int(cursor["ctx_through_seq"]), 6, "驱逐时并入 ctx 游标并落盘")
+        a.client.simulateCrash()
+
+        let b = Harness(root: root, key: "")
+        await b.settle()
+        let ls = allLines(dir)
+        XCTAssertEqual(ls.count, 1, "OPEN 段为空，只有合成行")
+        XCTAssertEqual(int(ls.first?["seq"]), 7)
+        XCTAssertEqual(int(ls.first?["oseq"]), 2)
+        let closed = b.readJSONL("sessions.jsonl").first { $0["session_id"] as? String == aSid }
+        XCTAssertEqual(int(closed?["last_seq"]), 7)
+        XCTAssertEqual(int(closed?["last_oseq"]), 2)
+    }
+
+    /// 恢复 oseq 高水位含本会话墓碑：尾部行写失败（write_failed 墓碑已落盘）后崩溃，合成行不复用那个已记墓碑的 oseq。
+    func testRecoveryOseqAboveTombstonedTail() async throws {
+        let root = makeTempDir("rtv-hw")
+        let a = Harness(root: root, key: "")
+        await a.settle()
+        a.client.log(.warn, "w1")
+        a.client.writer.debugBreakFd()
+        a.client.log(.warn, "w2 lost")
+        XCTAssertEqual(a.client.debugCounters.oseq, 2)
+        await a.work { $0.flushTombstones() }
+        let aSid = a.client.writer.currentSessionId
+        let dir = a.sessionDir()
+        a.client.simulateCrash()
+
+        let b = Harness(root: root, key: "")
+        await b.settle()
+        let synth = try XCTUnwrap(allLines(dir).last)
+        XCTAssertEqual(synth["tag"] as? String, "rtv.unclean_exit")
+        XCTAssertEqual(int(synth["oseq"]), 3)
+        let drops = b.readJSONL("drops.jsonl").filter { $0["session_id"] as? String == aSid }
+        XCTAssertEqual(drops.map { $0["reason"] as? String }, ["write_failed"], "已有墓碑覆盖，不再补 corrupt")
+        let closed = b.readJSONL("sessions.jsonl").first { $0["session_id"] as? String == aSid }
+        XCTAssertEqual(int(closed?["last_oseq"]), 3)
+        let covered = b.envelopes().filter { $0.1["session_id"] as? String == aSid }
+            .flatMap { lines(of: $0.1).compactMap { ($0["oseq"] as? NSNumber)?.int64Value } }.sorted()
+        XCTAssertEqual(covered, [1, 3])
+    }
+
     /// 同一 root 上另一个还活着的实例（同进程名的扩展误配等）：它的会话目录锁着，恢复流程不动它。
     func testLiveSessionIsNotRecovered() async throws {
         let root = makeTempDir("rtv-live")

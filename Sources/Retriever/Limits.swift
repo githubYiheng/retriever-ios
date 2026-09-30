@@ -69,6 +69,8 @@ enum ClientConstants {
     static let quarantineRetryMs: Int64 = 24 * 60 * 60 * 1000
     /// §3.7 传输请求超时。
     static let requestTimeoutS: Double = 30
+    /// 调度器地板：任何候选已到期时也至少等 1 s，杜绝 0 ms 自旋（发版前审查 H2）。
+    static let schedulerMinDelayMs: Int64 = 1000
     /// §3.1 stack 超长时中间插入的标记。
     static let stackMarker = "\n…[truncated]…\n"
     static let dayMs: Int64 = 24 * 60 * 60 * 1000

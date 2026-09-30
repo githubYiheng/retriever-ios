@@ -279,8 +279,7 @@ public final class SystemPlatform: PlatformHooks, @unchecked Sendable {
     }
 
     public func startObserving(_ sink: any PlatformEventSink) {
-        weak let weakSink = sink
-        let post: @Sendable (PlatformEvent) -> Void = { e in weakSink?.platformEvent(e) }
+        let post: @Sendable (PlatformEvent) -> Void = { [weak sink] e in sink?.platformEvent(e) }
         #if canImport(UIKit) && !os(watchOS)
         let nc = NotificationCenter.default
         let pairs: [(Notification.Name, PlatformEvent)] = [
