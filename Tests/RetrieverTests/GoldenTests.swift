@@ -71,7 +71,7 @@ final class GoldenTests: XCTestCase {
     func testConfigClamp() throws {
         let g = try Repo.golden("config.json")
         let vs = try XCTUnwrap(g["clamp"] as? [[String: Any]])
-        XCTAssertEqual(vs.count, 53)
+        XCTAssertEqual(vs.count, 50)
         for v in vs {
             let name = v["name"] as? String ?? ""
             let h = try XCTUnwrap(v["host"] as? [String: Any])
@@ -92,9 +92,8 @@ final class GoldenTests: XCTestCase {
             XCTAssertEqual(Int64(c.localCapBytes), int(e["local_cap_bytes"]), name)
             XCTAssertEqual(c.fullDump, e["full_dump"] as? Bool, name)
             XCTAssertEqual(Int64(c.fullDumpTtlS), int(e["full_dump_ttl_s"]), name)
-            XCTAssertEqual(c.backfillNetworks, e["backfill_networks"] as? String, name)
             XCTAssertEqual(Int64(c.dailyBatchCap), int(e["daily_batch_cap"]), name)
-            XCTAssertEqual(Set(e.keys).count, 13, name)
+            XCTAssertEqual(Set(e.keys).count, 12, name)
         }
     }
 

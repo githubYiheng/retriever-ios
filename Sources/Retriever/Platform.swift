@@ -188,8 +188,6 @@ public protocol PlatformHooks: Sendable {
     func endBackgroundTask(_ token: Int)
     /// 开始把生命周期与网络恢复事件送给 sink。
     func startObserving(_ sink: any PlatformEventSink)
-    /// 当前网络是否计量（蜂窝 / 个人热点）；未知按 false。
-    func isExpensiveNetwork() -> Bool
     /// 可用磁盘空间（nil = 未知，不按空间收缩上限）。
     func availableBytes(at url: URL) -> Int64?
 }
@@ -201,7 +199,6 @@ public final class SystemPlatform: PlatformHooks, @unchecked Sendable {
     #if canImport(Network)
     private var monitor: NWPathMonitor?
     private var lastSatisfied = true
-    private var expensive = false
     #endif
 
     public init() {}
@@ -307,7 +304,6 @@ public final class SystemPlatform: PlatformHooks, @unchecked Sendable {
             self.lock.lock()
             let was = self.lastSatisfied
             self.lastSatisfied = path.status == .satisfied
-            self.expensive = path.isExpensive
             self.lock.unlock()
             // 只用于提前唤醒，不做可达性预检。
             if !was && path.status == .satisfied { post(.networkRestored) }
@@ -316,17 +312,6 @@ public final class SystemPlatform: PlatformHooks, @unchecked Sendable {
         lock.lock()
         monitor = m
         lock.unlock()
-        #endif
-    }
-
-    public func isExpensiveNetwork() -> Bool {
-        #if canImport(Network)
-        lock.lock()
-        defer { lock.unlock() }
-        if let m = monitor { return m.currentPath.isExpensive }
-        return expensive
-        #else
-        return false
         #endif
     }
 

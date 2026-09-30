@@ -245,7 +245,7 @@ public final class RetrieverClient: PlatformEventSink, @unchecked Sendable {
         switch stop {
         case "offline": return "offline"
         case "backoff": return "backoff"
-        case "paused", "upload_disabled", "not_configured", "locked", "metered", "disabled": return "paused"
+        case "paused", "upload_disabled", "not_configured", "locked", "disabled": return "paused"
         default: return "timeout"
         }
     }

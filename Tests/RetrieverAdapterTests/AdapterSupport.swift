@@ -39,7 +39,6 @@ struct NullPlatform: PlatformHooks {
     func beginBackgroundTask(name: String, onExpire: @escaping @Sendable () -> Void) -> Int? { nil }
     func endBackgroundTask(_ token: Int) {}
     func startObserving(_ sink: any PlatformEventSink) {}
-    func isExpensiveNetwork() -> Bool { false }
     func availableBytes(at url: URL) -> Int64? { nil }
 }
 

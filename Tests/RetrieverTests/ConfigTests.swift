@@ -93,21 +93,18 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(t.batchRequests.count, 3)
     }
 
-    func testBackfillWaitsForUnmeteredNetwork() async throws {
+    /// 不看网络类型（ADR 0009）：backfill 批与其它批走同一套队列 / 退避规则，生成后照常上传。
+    func testBackfillUploadsLikeOtherBatches() async throws {
         let t = FakeTransport()
         let h = Harness(key: "", transport: t)
         await h.settle()
         h.client.log(.debug, "history")
         await h.seal()
-        h.platform.expensive = true
         t.configBody = ["etag": "fd", "full_dump": true, "full_dump_ttl_s": 3600]
         await h.enableUpload()
-        XCTAssertEqual(h.outboxFiles("p2").count, 1)
-        XCTAssertEqual(t.batchRequests.count, 0, "计量网络上不传 backfill")
-        h.platform.expensive = false
-        h.client.platformEvent(.networkRestored)
-        await h.settle()
-        XCTAssertEqual(t.batchRequests.count, 1)
+        XCTAssertEqual(t.batchRequests.count, 1, "backfill 不等网络，照常上传")
+        let env = try XCTUnwrap(decodeEnvelope(try XCTUnwrap(t.batchRequests[0].body)))
+        XCTAssertEqual(env["kind"] as? String, "backfill")
         XCTAssertEqual(h.outboxFiles(), [])
     }
 }

@@ -108,7 +108,7 @@ final class EnvelopeCrossLangTests: XCTestCase {
             for i in 0..<20 { h.client.log(i % 2 == 0 ? .debug : .info, "history \(i)") }
             h.client.log(.warn, "w")
             await h.seal()
-            h.transport.configBody = ["etag": "e1", "ttl_s": 600, "full_dump": true, "full_dump_ttl_s": 3600, "backfill_networks": "any"]
+            h.transport.configBody = ["etag": "e1", "ttl_s": 600, "full_dump": true, "full_dump_ttl_s": 3600]
             h.transport.defaultReply = .status(503, nil, [:])     // 不确认，批留在出站箱里供检查
             await h.enableUpload()
             let bf = try XCTUnwrap(h.envelopes("p2").first?.1)

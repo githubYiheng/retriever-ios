@@ -16,7 +16,7 @@ extension Engine {
     }
 
     /// 选下一批：p0 > p1 > p2，同级 created_ms 升序（失败过的批让到后面，避免头阻塞）；单在途；相邻请求 ≥ 2 s；
-    /// 全局或对应类别未暂停；backfill 在计量网络上不传（backfill_networks = unmetered）。
+    /// 全局或对应类别未暂停。
     func nextSend() -> SendStep {
         let nowMono = clock.monoMs()
         if key.isEmpty { return .stop(reason: "not_configured", wakeMono: nil) }
@@ -36,20 +36,16 @@ extension Engine {
         let candidates = metas.values.filter { $0.prio < 3 }
         if candidates.isEmpty { return .stop(reason: "empty", wakeMono: nil) }
         let pausedCats = pauseActive ? Set(backoff.pausedCategories) : []
-        let meteredBlock = effective.config.backfillNetworks == "unmetered" && platform.isExpensiveNetwork()
         let eligible = candidates.filter { m in
             if let c = m.category, pausedCats.contains(c) { return false }
-            if m.kind == .backfill && meteredBlock { return false }
             return true
         }.sorted {
             let f0 = (fails[$0.name]?.count ?? 0) > 0 ? 1 : 0
             let f1 = (fails[$1.name]?.count ?? 0) > 0 ? 1 : 0
             return (f0, $0.prio, $0.createdMs, $0.name) < (f1, $1.prio, $1.createdMs, $1.name)
         }
-        guard let pick = eligible.first else {
-            if !pausedCats.isEmpty { return .stop(reason: "paused", wakeMono: backoff.pausedUntilMono) }
-            return .stop(reason: "metered", wakeMono: nil)
-        }
+        // candidates 非空时 eligible 为空只可能是类别暂停
+        guard let pick = eligible.first else { return .stop(reason: "paused", wakeMono: backoff.pausedUntilMono) }
         guard acquireUploadLock() else { return .stop(reason: "locked", wakeMono: nowMono + 60_000) }
         guard let body = FS.read(outboxDir.appendingPathComponent(pick.name)), let inst = install else {
             metas.removeValue(forKey: pick.name)

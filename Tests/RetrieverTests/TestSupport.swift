@@ -154,7 +154,6 @@ func decodeEnvelope(_ gz: Data) -> [String: Any]? {
 
 final class FakePlatform: PlatformHooks, @unchecked Sendable {
     private let lock = NSLock()
-    var expensive = false
     var available: Int64? = nil
     var foreground = true
     private(set) var begun: [Int] = []
@@ -184,7 +183,6 @@ final class FakePlatform: PlatformHooks, @unchecked Sendable {
     var endedTokens: [Int] { lock.lock(); defer { lock.unlock() }; return ended }
     var begunTokens: [Int] { lock.lock(); defer { lock.unlock() }; return begun }
     func startObserving(_ sink: any PlatformEventSink) {}
-    func isExpensiveNetwork() -> Bool { expensive }
     func availableBytes(at url: URL) -> Int64? { available }
 }
 

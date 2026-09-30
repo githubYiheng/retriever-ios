@@ -13,7 +13,6 @@ struct RemoteConfig: Equatable, Sendable {
     var localCapBytes: Int
     var fullDump: Bool
     var fullDumpTtlS: Int
-    var backfillNetworks: String
     var dailyBatchCap: Int
 }
 
@@ -62,10 +61,6 @@ enum ConfigRules {
             localCapBytes: clampInt(JSONIn.double(r["local_cap_bytes"]), Limits.localCapBytesMin, Limits.localCapBytesMax, Limits.localCapBytesDefault),
             fullDump: JSONIn.bool(r["full_dump"]) ?? false,
             fullDumpTtlS: clampInt(JSONIn.double(r["full_dump_ttl_s"]), 0, fullDumpTtlSMax, 0),
-            backfillNetworks: {
-                let v = JSONIn.string(r["backfill_networks"])
-                return (v == "unmetered" || v == "any") ? v! : "unmetered"
-            }(),
             dailyBatchCap: clampInt(JSONIn.double(r["daily_batch_cap"]), 0, Limits.dailyBatchCapMax, hostCap)
         )
     }
@@ -102,7 +97,6 @@ enum ConfigRules {
         o.raw(",\"local_cap_bytes\":"); o.int(c.localCapBytes)
         o.raw(",\"full_dump\":"); o.bool(c.fullDump)
         o.raw(",\"full_dump_ttl_s\":"); o.int(c.fullDumpTtlS)
-        o.raw(",\"backfill_networks\":"); o.string(c.backfillNetworks)
         o.raw(",\"daily_batch_cap\":"); o.int(c.dailyBatchCap)
         o.raw("}")
         return o.bytes
