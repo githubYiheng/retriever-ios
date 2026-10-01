@@ -50,7 +50,18 @@ public final class SharedClient: @unchecked Sendable {
 
     // MARK: 宿主 API
 
-    public func configure(key: String, baseURL: URL, options: Options) {
+    /// key 先修剪（ADR 0025），先于首次 / 再次 configure 两条路径：之后指纹、请求头、同参数判定都用修剪后的值。
+    /// 配置诊断在共享锁之外出（出口不在持 SDK 锁时调；禁用时照常出）。
+    public func configure(key rawKey: String, baseURL: URL, options: Options) {
+        let key = ConfigCheck.trim(rawKey)
+        apply(key: key, baseURL: baseURL, options: options)
+        let fp = ConfigRules.keyFingerprint(key)
+        for d in ConfigCheck.check(rawKey: rawKey, key: key, baseURL: baseURL) {
+            ConfigDiagnostics.emit(d, keyFp: fp, baseURL: baseURL.absoluteString)
+        }
+    }
+
+    private func apply(key: String, baseURL: URL, options: Options) {
         lock.lock()
         defer { lock.unlock() }
         let root = rootFor(options.appGroup)

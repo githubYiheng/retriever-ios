@@ -6,14 +6,16 @@ import Darwin
 /// 出站队列与响应分类（§3.6 / §3.7，宪法 R-2 / R-3）。决策在 work 队列上，网络在队列外。
 extension Engine {
     enum SendStep {
-        /// `keyFp`：发这一批用的 key 指纹（响应回来时与当前比较，ADR 0024 决定 7）。
-        case send(name: String, request: HTTPRequest, keyFp: String)
+        /// `keyFp`：发这一批用的 key 指纹（响应回来时与当前比较，ADR 0024 决定 7）；`baseURL`：同一请求的 baseURL（配置诊断用，ADR 0025）。
+        case send(name: String, request: HTTPRequest, keyFp: String, baseURL: String)
         case stop(reason: String, wakeMono: Int64?)
     }
 
     struct ResponseEffect {
         var fetchConfig = false
         var acked = false
+        /// 进入了鉴权暂停（且请求用的是当前 key 指纹与 baseURL）：调用方在 work 队列之外出 `key_rejected`（ADR 0025）。
+        var keyRejected: ConfigCheck.Diagnostic?
     }
 
     /// 选下一批：p0 > p1 > p2，同级 created_ms 升序（失败过的批让到后面，避免头阻塞）；单在途；相邻请求 ≥ 2 s；
@@ -64,7 +66,7 @@ extension Engine {
             ], body: Data(body))
             inFlight = pick.name
             lastRequestMono = nowMono
-            return .send(name: pick.name, request: req, keyFp: keyFp)
+            return .send(name: pick.name, request: req, keyFp: keyFp, baseURL: baseURL.absoluteString)
         }
         return .stop(reason: "unreadable", wakeMono: nil)
     }
@@ -93,8 +95,10 @@ extension Engine {
 
     // MARK: 响应分类
 
-    /// `keyFp`：请求用的 key 指纹；`sdkCancelled`：SDK 自己取消的（purge、后台到期）——不计毒批失败（ADR 0024 决定 10）。
-    func handleResponse(name: String, response: HTTPResponse?, keyFp reqFp: String? = nil, sdkCancelled: Bool = false) -> ResponseEffect {
+    /// `keyFp` / `baseURL`：请求用的 key 指纹与 baseURL（nil = 视为当前）；`sdkCancelled`：SDK 自己取消的（purge、后台到期）——
+    /// 不计毒批失败（ADR 0024 决定 10）。
+    func handleResponse(name: String, response: HTTPResponse?, keyFp reqFp: String? = nil, baseURL reqBase: String? = nil,
+                        sdkCancelled: Bool = false) -> ResponseEffect {
         var eff = ResponseEffect()
         if inFlight == name { inFlight = nil }
         guard let meta = metas[name] else { return eff }
@@ -122,7 +126,12 @@ extension Engine {
             // 只认服务端的明确表态（JSON 对象且 reason 是字符串，未知值同样算）；边缘 / WAF / captive portal 替服务端回的
             // 401 / 403（HTML、空体、无 reason）按「其它」：全局退避 + 计毒批（ADR 0011）
             if let reason = body?["reason"] as? String {
-                authPause(reason: reason)
+                let dur = authPause(reason: reason)
+                // 配置诊断（ADR 0025）：进入暂停的那一刻、请求用的是当前 key 指纹（上面已判）与 baseURL 才出；暂停本身不看 baseURL（不改行为）
+                if (reqBase ?? baseURL.absoluteString) == baseURL.absoluteString {
+                    eff.keyRejected = .keyRejected(status: r.status, reason: ConfigCheck.sanitizeReason(reason),
+                                                   minutes: ConfigCheck.pauseMinutes(dur))
+                }
             } else {
                 failure(name, retryAfterS: nil, reason: "http_\(r.status)", countFail: true)
             }
@@ -234,8 +243,8 @@ extension Engine {
         if f.count >= Limits.poisonConsecutiveFails && f.otherSuccess { quarantine(name) }
     }
 
-    /// 带 reason 的 401 / 403：全局暂停 1 h 起倍增到 24 h（2xx 确认后复位）；照常写本地、照常拉配置；不删任何文件。
-    private func authPause(reason: String) {
+    /// 带 reason 的 401 / 403：全局暂停 1 h 起倍增到 24 h（2xx 确认后复位）；照常写本地、照常拉配置；不删任何文件。返回本次暂停时长（ms）。
+    private func authPause(reason: String) -> Int64 {
         let prev: Int64? = backoff.reason.hasPrefix("auth:") ? Int64(backoff.reason.dropFirst(5)) : nil
         let dur = prev.map { min($0 * 2, Limits.pause401MaxMs) } ?? Limits.pause401BaseMs
         backoff.pausedCategories = ["all"]
@@ -243,6 +252,7 @@ extension Engine {
         backoff.pausedUntilMs = clock.wallMs() + dur
         backoff.reason = "auth:\(dur)"
         persistBackoff()
+        return dur
     }
 
     /// 429：按 categories 暂停到 now + retry_after_s（单调；钳制 1 s–1 h；±20% 抖动）；`all` = 全局。不计毒批。

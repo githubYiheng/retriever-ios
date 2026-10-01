@@ -5,7 +5,7 @@
 
 ## [0.3.0] - 2026-10-01
 
-configure 之前没有实例（ADR 0023）、配置缓存只记远程明确给的值（ADR 0022）、宿主误用加固（ADR 0024）。公开 API 签名不变（无增减）；
+configure 之前没有实例（ADR 0023）、配置缓存只记远程明确给的值（ADR 0022）、宿主误用加固（ADR 0024）、配置诊断（ADR 0025）。公开 API 签名不变（无增减）；
 盘上只加可选键与新文件，0.2.x / 0.1.x 留下的状态全部照读（原地升级，不需要迁移；见下「升级」）；信封与线协议不变。
 
 ### 默认行为变化（升级前请读）
@@ -29,6 +29,9 @@ configure 之前没有实例（ADR 0023）、配置缓存只记远程明确给�
 ### 新增
 - 合成 warn（`synthetic: true`，不经 `redact`）：`rtv.pre_init_dropped`（没写成的行的计数：pre 文件满 / 写不进、还没有会话）、
   `rtv.root_vanished`（SDK 目录在运行中被删、已重新建会话）、`rtv.reconfigure_ignored`。
+- **配置诊断**（ADR 0025）：key 为空 / 带首尾空白 / 格式或校验位不对 / 与端点环境不符、baseURL 不是 http(s)、服务端拒绝 key 时，写系统日志
+  （subsystem `org.revdog.retriever`、category `diagnostics`；六个 code 见 README「接错 key / 地址时怎么看」）。只出诊断，不拦请求、不停写本地；
+  唯一的行为变化：key 首尾的空白与控制字符在 `configure` 时去掉后再用（此前原样进请求头，必然 401）。
 
 ### 修复
 - **没有会话时 `log()` 静默丢**（首次解锁前启动、启动时磁盘满、purge 重建失败）：改为计数并在有会话后上报。会话的 `meta.json` 写不成 = 建会话失败、稍后重试。

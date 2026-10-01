@@ -110,7 +110,7 @@ public enum FlushResult: Sendable, Equatable {
 /// 静态入口：转发到进程内共享入口。`configure` 之前的 `log()` 也落盘（追加到 pre 文件，configure 时按本次 Options 收编）。
 public enum Retriever {
     /// 首次调用建实例并收编之前写的行；之后的调用改 key / baseURL / 级别 / redact 等（processName / appGroup 只认首次）。
-    /// 参数与上次完全相同时只更新 redact。
+    /// 参数与上次完全相同时只更新 redact。key 首尾的空白与控制字符先去掉再用；key / baseURL 不对时写系统日志诊断（ADR 0025）。
     public static func configure(key: String,
                                  baseURL: URL = URL(string: "https://logs.revdog.org")!,
                                  options: Options = Options()) {

@@ -137,6 +137,29 @@ RETRIEVER_BASE_URL = https:/$()/logs.revdog.org
 在 target 的基础 xcconfig 里 `#include? "Retriever.local.xcconfig"`，Info.plist 加两项：
 `RetrieverKey` = `$(RETRIEVER_KEY)`、`RetrieverBaseURL` = `$(RETRIEVER_BASE_URL)`。没有本地文件时 key 为空：只写本地不上传。
 
+## 接错 key / 地址时怎么看（0.3.0，ADR 0025）
+
+`configure` 时 SDK 在本地检查 key 与 baseURL，服务端拒绝 key 时也会说出来，都写进**系统日志**：subsystem `org.revdog.retriever`、
+category `diagnostics`，消息 `.public`。只出诊断、不拦请求（请求照发，服务端是唯一裁决者）；**SDK 不会因此停写本地**，key / 地址改对后之前的日志照常补传。
+消息是写死的英文句子，不含 key 的任何部分。
+
+| code | 级别 | 何时 |
+|---|---|---|
+| `no_key` | info | key 为空（含去掉空白后为空）：只写本地、永不上传 |
+| `key_trimmed` | notice | key 首尾有空白 / 控制字符（CI secret 尾部换行、复制时带的空格），已去掉后再用 |
+| `key_malformed` | notice | 不是合法的 Retriever key（格式或末 8 位校验不对），服务端会拒绝 |
+| `key_env_mismatch` | notice | `lk_test_` key 配生产地址 `logs.revdog.org`，或 `lk_live_` key 配 staging 地址 `logs-staging.revdog.org` |
+| `base_url_invalid` | notice | baseURL 不是带主机的 http(s) URL（例如 `URL(string: "logs.revdog.org")` 漏了 `https://`），上传会一直失败 |
+| `key_rejected` | notice | 服务端以 401 / 403 拒绝当前 key，上传进入暂停（1 h 起倍增到 24 h）：`server rejected the key (HTTP 401, reason=…); uploads paused for 60 min; logs are kept locally` |
+
+- 同一（code, key, baseURL）每进程最多一条；`setEnabled(false)` 时照常出（接入时正需要看）。
+- key 首尾的空白与控制字符在 `configure` 时去掉后再用（请求头、「参数与上次相同」的判定都用去掉后的值）；baseURL 是 `URL`，不做修剪。
+- 怎么看：
+  - Xcode 调试时直接出现在控制台。
+  - Console.app：左栏选设备 / 模拟器，搜索 `subsystem:org.revdog.retriever`；`no_key` 是 info 级，要打开菜单 Action → Include Info Messages 才显示。
+  - 命令行：`log stream --predicate 'subsystem == "org.revdog.retriever"'`（加 `--level info` 才含 `no_key`）；
+    模拟器里的 app 用 `xcrun simctl spawn booted log stream --level info --predicate 'subsystem == "org.revdog.retriever"'`。
+
 ## 适配器
 
 ### swift-log

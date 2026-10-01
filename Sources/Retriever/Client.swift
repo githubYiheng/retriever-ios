@@ -955,7 +955,7 @@ public final class RetrieverClient: PlatformEventSink, @unchecked Sendable {
                 case .stop(let reason, let wake):
                     ctl.with { $0.lastStop = (reason, wake) }
                     break loop
-                case .send(let name, let req, let fp):
+                case .send(let name, let req, let fp, let base):
                     if ctl.with({ $0.purging > 0 }) {
                         // 取批之后、发出之前清空开始了：这一批要随 root 一起清掉，不发
                         await onWork { [self] in if engine.inFlight == name { engine.inFlight = nil } }
@@ -967,8 +967,10 @@ public final class RetrieverClient: PlatformEventSink, @unchecked Sendable {
                     // SDK 自己取消的（purge、后台到期）不计毒批失败（ADR 0024 决定 10）
                     let cancelled = resp == nil && ctl.with { $0.cancelEpoch } != epoch
                     let eff = await onWork { [self] in
-                        engine.handleResponse(name: name, response: resp, keyFp: fp, sdkCancelled: cancelled)
+                        engine.handleResponse(name: name, response: resp, keyFp: fp, baseURL: base, sdkCancelled: cancelled)
                     }
+                    // 配置诊断在 work 队列与任何 SDK 锁之外出（ADR 0025）
+                    if let d = eff.keyRejected { ConfigDiagnostics.emit(d, keyFp: fp, baseURL: base) }
                     if eff.fetchConfig { fetchConfig() }
                 }
             }

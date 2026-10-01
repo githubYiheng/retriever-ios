@@ -74,6 +74,7 @@ final class FakeTransport: Transport, @unchecked Sendable {
         case network                                // 网络错误
         case hang                                   // 挂起直到 cancelAll
         case heldConfig                             // 配置请求挂起直到 releaseHeldConfigs（按请求时刻的 configBody 回 200）
+        case heldStatus(Int, [String: Any]?)        // 批请求挂起直到 releaseHeldBatches，届时回该状态与响应体（在途请求竞态）
     }
 
     private let lock = NSLock()
@@ -94,8 +95,20 @@ final class FakeTransport: Transport, @unchecked Sendable {
     private(set) var cancelCount = 0
     private var hanging: [CheckedContinuation<HTTPResponse?, Never>] = []
     private var held: [(CheckedContinuation<HTTPResponse?, Never>, [String: Any]?)] = []
+    private var heldBatches: [(CheckedContinuation<HTTPResponse?, Never>, HTTPResponse)] = []
 
     func setScript(_ s: [Reply]) { lock.lock(); script = s; lock.unlock() }
+
+    var heldBatchCount: Int { lock.lock(); defer { lock.unlock() }; return heldBatches.count }
+
+    /// 放行 heldStatus 挂住的批请求：各自回预定的状态与响应体。
+    func releaseHeldBatches() {
+        lock.lock()
+        let h = heldBatches
+        heldBatches = []
+        lock.unlock()
+        for (c, r) in h { c.resume(returning: r) }
+    }
 
     var batchRequests: [HTTPRequest] {
         lock.lock(); defer { lock.unlock() }
@@ -162,15 +175,21 @@ final class FakeTransport: Transport, @unchecked Sendable {
             return await withCheckedContinuation { c in
                 lock.withLock { held.append((c, cfg)) }
             }
+        case .heldStatus(let code, let body):
+            let r = HTTPResponse(status: code, body: body.map(json) ?? Data())
+            return await withCheckedContinuation { c in
+                lock.withLock { heldBatches.append((c, r)) }
+            }
         }
     }
 
     func cancelAll() {
         lock.lock()
         cancelCount += 1
-        let h = hanging + held.map(\.0)
+        let h = hanging + held.map(\.0) + heldBatches.map(\.0)
         hanging = []
         held = []
+        heldBatches = []
         lock.unlock()
         for c in h { c.resume(returning: nil) }
     }
