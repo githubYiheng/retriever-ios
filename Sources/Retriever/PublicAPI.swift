@@ -1,6 +1,7 @@
 import Foundation
 
-// 宿主 API（方案 §3.10，三端同名）。签名照简报，不加不减。
+// 宿主 API（方案 §3.10，三端同名）。已发布的签名不改不减，只增（0.2.0 增：`isEnabled`、`purgeLocal(completion:)`、
+// `AttrValue.int(_:)`、`RetrieverLogger(subsystem:category:publicSystemLog:)`，ADR 0020）。
 
 /// 日志级别；`Comparable` 按 debug < info < warn < error < fatal。
 public enum LogLevel: String, Sendable, Codable, CaseIterable, Comparable {
@@ -20,10 +21,20 @@ public enum LogLevel: String, Sendable, Codable, CaseIterable, Comparable {
 }
 
 /// attrs 的值：扁平 string / number / bool（§3.1）。number 用 Double；非有限数在编码时转 string。
+/// 整数（订单号、雪花 id 等）用 `.int(_:)`：超出 Double 能精确表示的范围时按十进制字符串输出，不会被改写成错误的数。
 public enum AttrValue: Sendable, Equatable {
     case string(String)
     case number(Double)
     case bool(Bool)
+}
+
+extension AttrValue {
+    /// 整数型 attrs（ADR 0020 决定 3）：|v| ≤ 2^53 − 1 → `.number`（JSON 数字，逐字节同以前）；否则 → `.string`（十进制串）。
+    /// 值没丢、只是换了类型，所以不打 `truncated`。是静态工厂不是新 case：宿主对 `AttrValue` 的穷举 switch 不受影响。
+    public static func int(_ v: Int64) -> AttrValue {
+        let maxSafe: Int64 = 9_007_199_254_740_991
+        return (-maxSafe...maxSafe).contains(v) ? .number(Double(v)) : .string(String(v))
+    }
 }
 
 /// 异常（§3.1 `exc`）。
@@ -62,7 +73,7 @@ public struct LogLine: Sendable {
 /// SDK 版本号（唯一来源）：进 `device.sdk = "retriever-ios/<ver>"` 与 `X-Rtv-Sdk`。
 /// 发布门禁（`scripts/sdk-ios-release.sh`）要求它 == 发布版本号。
 public enum RetrieverVersion {
-    public static let current = "0.1.4"
+    public static let current = "0.2.0"
 }
 
 /// 宿主选项（§3.10；ADR 0004 / 0005）。
@@ -79,7 +90,7 @@ public struct Options: Sendable {
     public var redact: (@Sendable (LogLine) -> LogLine?)? = nil
     /// 会话目录 `proc-<name>`（§3.2）与信封 `process`。
     public var processName: String = "main"
-    /// 可选：App Group 共享容器（扩展场景）。
+    /// 可选：App Group 共享容器（扩展场景）。**暂不支持生产**：挂起时会持有组容器里的文件锁，可能被系统以 0xdead10cc 终止。
     public var appGroup: String? = nil
     /// 进 `device.sdk = "retriever-ios/<ver>"` 与 `X-Rtv-Sdk`。
     public var sdkVersion: String = RetrieverVersion.current
@@ -114,12 +125,26 @@ public enum Retriever {
         await SharedClient.shared.client().flush(includeContext: includeContext)
     }
 
+    /// 用户同意 / 撤回。`false`：不写不传、不拉配置，落盘为 root 同级的标记文件，跨重启有效（直到 `setEnabled(true)`）。
+    /// 在 `configure` 之前调用也生效（作为初值并落盘）。
     public static func setEnabled(_ enabled: Bool) {
         SharedClient.shared.client().setEnabled(enabled)
     }
 
+    /// 本进程当前是否启用（启动时从盘上的禁用标记初始化）。
+    public static var isEnabled: Bool {
+        SharedClient.shared.client().isEnabled
+    }
+
+    /// 清空本地（新 install_id）。不阻塞调用线程：返回时清空尚未完成，需要新 `installId` 用 `purgeLocal(completion:)`。
+    /// `purgeLocal()` 返回到清空完成之间写的行会随旧状态一起删除。
     public static func purgeLocal() {
         SharedClient.shared.client().purgeLocal()
+    }
+
+    /// 同 `purgeLocal()`；清空与重建完成后在后台线程回调（此时 `installId` 已是新值）。
+    public static func purgeLocal(completion: @escaping @Sendable () -> Void) {
+        SharedClient.shared.client().purgeLocal(completion: completion)
     }
 
     /// 生效的自动上传级别（远程配置钳制后；full_dump 期间为 debug）。未 configure 时 = Options 默认。
@@ -144,20 +169,31 @@ public enum Retriever {
 
 /// 进程内共享实例（惰性创建；configure 前用默认 root 与默认 options）。
 final class SharedClient: @unchecked Sendable {
+    /// 建实例：(root, key, baseURL, options, 带过来的宿主显式开关；nil = 按盘上标记)。
+    typealias Make = @Sendable (URL, String, URL, Options, Bool?) -> RetrieverClient
+
     static let shared = SharedClient()
 
     private let lock = NSLock()
     private var instance: RetrieverClient?
+    private let rootFor: @Sendable (String?) -> URL
+    private let make: Make
+
+    /// 测试注入 root 与实例工厂；生产用默认值。
+    init(rootFor: @escaping @Sendable (String?) -> URL = { RetrieverClient.defaultRoot(appGroup: $0) },
+         make: @escaping Make = { root, key, baseURL, options, enabled in
+             RetrieverClient(root: root, key: key, baseURL: baseURL, options: options, clock: SystemClock(),
+                             transport: URLSessionTransport(), platform: SystemPlatform(), enabled: enabled)
+         }) {
+        self.rootFor = rootFor
+        self.make = make
+    }
 
     func client() -> RetrieverClient {
         lock.lock()
         defer { lock.unlock() }
         if let c = instance { return c }
-        let options = Options()
-        let c = RetrieverClient(root: RetrieverClient.defaultRoot(appGroup: nil), key: "",
-                                baseURL: URL(string: "https://logs.revdog.org")!, options: options,
-                                clock: SystemClock(), transport: URLSessionTransport(),
-                                platform: SystemPlatform())
+        let c = make(rootFor(nil), "", URL(string: "https://logs.revdog.org")!, Options(), nil)
         instance = c
         return c
     }
@@ -165,7 +201,8 @@ final class SharedClient: @unchecked Sendable {
     func configure(key: String, baseURL: URL, options: Options) {
         lock.lock()
         defer { lock.unlock() }
-        let root = RetrieverClient.defaultRoot(appGroup: options.appGroup)
+        let root = rootFor(options.appGroup)
+        var enabled: Bool?
         if let c = instance {
             if c.root.standardizedFileURL == root.standardizedFileURL
                 && c.processName == RetrieverClient.sanitizeProcessName(options.processName) {
@@ -173,11 +210,11 @@ final class SharedClient: @unchecked Sendable {
                 return
             }
             // root / 进程名变了（appGroup、processName 应在第一次 log 之前 configure）：
-            // 旧实例封段收尾，新实例接管；旧 root 里的会话由下次打开该 root 的实例恢复。
+            // 旧实例只投递封段收尾、不等待（锁内不做任何等待，ADR 0020 决定 1），新实例接管；
+            // 旧 root 里的会话由下次打开该 root 的实例恢复。宿主显式的 setEnabled（configure 之前的调用）带到新实例、落盘到新 root 旁。
             c.shutdown()
+            enabled = c.explicitEnabled
         }
-        instance = RetrieverClient(root: root, key: key, baseURL: baseURL, options: options,
-                                   clock: SystemClock(), transport: URLSessionTransport(),
-                                   platform: SystemPlatform())
+        instance = make(root, key, baseURL, options, enabled)
     }
 }

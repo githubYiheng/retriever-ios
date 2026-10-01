@@ -51,6 +51,19 @@ enum FS {
         (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
     }
 
+    /// 列目录，区分「不是目录（[]）」与「是目录却列不出（nil）」：身份修复要靠后者判断「本次失败、稍后重试」。
+    static func listStrict(_ dir: URL) -> [String]? {
+        var st = stat()
+        if stat(dir.path, &st) != 0 { return errno == ENOENT ? [] : nil }
+        guard (st.st_mode & S_IFMT) == S_IFDIR else { return [] }
+        return try? FileManager.default.contentsOfDirectory(atPath: dir.path)
+    }
+
+    /// 删一个文件；本来就不存在也算成功。
+    static func unlinkIfPresent(_ url: URL) -> Bool {
+        unlink(url.path) == 0 || errno == ENOENT
+    }
+
     static func read(_ url: URL) -> [UInt8]? {
         let fd = open(url.path, O_RDONLY | O_CLOEXEC)
         if fd < 0 { return nil }
@@ -122,12 +135,19 @@ enum FS {
     }
 
     /// 追加一段字节（一次 write 循环）；文件不存在则创建并打标。
+    /// 追加到一半失败：截回追加前的长度（ADR 0019 决定 5），半行不会和下一条粘连、连累下一条被读侧丢掉。
     @discardableResult
     static func append(_ url: URL, _ bytes: [UInt8]) -> Bool {
         let existed = exists(url)
         let fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0o600)
         if fd < 0 { return false }
+        var st = stat()
+        guard fstat(fd, &st) == 0 else {
+            close(fd)
+            return false
+        }
         let ok = bytes.withUnsafeBytes { writeAll(fd, $0) }
+        if !ok { _ = ftruncate(fd, st.st_size) }
         close(fd)
         if !existed { markFile(url) }
         return ok

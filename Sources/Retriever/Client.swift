@@ -5,7 +5,8 @@ import Foundation
 /// 并发模型：
 /// - 热路径 `log()` 只碰 `Writer`（NSLock，锁内一次 write(2)），不排队、不等待任何后台工作；
 /// - 其余一切磁盘状态（封段、物化、出站箱、驱逐、恢复、配置、队列决策）在串行 `work` 队列上；
-/// - 网络请求在队列外（async），发送前后各回队列一次做决策与落盘。
+/// - 网络请求在队列外（async），发送前后各回队列一次做决策与落盘；
+/// - 宿主线程永不等待 `work` 队列（ADR 0020 决定 1）：fatal、purgeLocal、换 root 的收尾一律投递后立即返回。
 @_spi(RetrieverTesting)
 public final class RetrieverClient: PlatformEventSink, @unchecked Sendable {
     public let root: URL
@@ -18,6 +19,12 @@ public final class RetrieverClient: PlatformEventSink, @unchecked Sendable {
     let work = DispatchQueue(label: "retriever.work", qos: .utility)
     private let workKey = DispatchSpecificKey<Bool>()
     private let ctl = Control()
+    /// 串行化「内存开关 + 盘上禁用标记」的变更（setEnabled 在宿主线程，补写标记在 work 队列）；锁内只有一次 unlink / 读写标志。
+    private let enabledLock = NSLock()
+    /// 禁用标记还没写成（写失败每次调度 tick 重试）。受 enabledLock 保护。
+    private var markerPending = false
+    /// 宿主在本实例上最后一次显式 setEnabled 的值（nil = 没调过）；换 root 时带给新实例。受 enabledLock 保护。
+    private var requestedEnabled: Bool?
 
     /// 锁保护的调度 / 排空 / 后台任务状态。
     final class Control: @unchecked Sendable {
@@ -35,6 +42,10 @@ public final class RetrieverClient: PlatformEventSink, @unchecked Sendable {
         var timerTask: Task<Void, Never>?
         var timerTarget: Int64?
         var configFetching = false
+        /// 拉配置在途时又有新请求（身份变了等）：在途结束后再拉一次。
+        var configRefetch = false
+        /// 进行中的 purgeLocal 个数：> 0 时排空每次取批前退出、不拉配置。
+        var purging = 0
         var bgToken: Int?
         var tombstoneScheduled = false
         var closed = false
@@ -49,8 +60,16 @@ public final class RetrieverClient: PlatformEventSink, @unchecked Sendable {
     }
 
     @_spi(RetrieverTesting)
-    public init(root: URL, key: String, baseURL: URL, options: Options, clock: any Clock,
-                transport: any Transport, platform: any PlatformHooks) {
+    public convenience init(root: URL, key: String, baseURL: URL, options: Options, clock: any Clock,
+                            transport: any Transport, platform: any PlatformHooks) {
+        self.init(root: root, key: key, baseURL: baseURL, options: options, clock: clock, transport: transport,
+                  platform: platform, enabled: nil)
+    }
+
+    /// `enabled`：换 root 时从旧实例带过来的宿主显式 setEnabled（configure 之前的调用），作为初值并落盘到新 root 旁
+    /// （ADR 0020 决定 2）；nil = 按盘上标记。
+    init(root: URL, key: String, baseURL: URL, options: Options, clock: any Clock,
+         transport: any Transport, platform: any PlatformHooks, enabled: Bool?) {
         self.root = root
         self.processName = RetrieverClient.sanitizeProcessName(options.processName)
         self.clock = clock
@@ -61,6 +80,16 @@ public final class RetrieverClient: PlatformEventSink, @unchecked Sendable {
                              clock: clock, platform: platform, writer: writer)
         work.setSpecific(key: workKey, value: true)
         ctl.redact = options.redact
+        // 开关在同步 bootstrap 之前初始化（写入只看这个内存开关；startup 的排空 / 拉配置不会抢在禁用生效之前）：
+        // 默认从盘上标记；带过来的显式值照 setEnabled 的规则落盘（true 删标记、删不掉保持禁用；false 稍后写标记）
+        var on = !FS.exists(engine.disabledMarkerURL)
+        if let e = enabled {
+            on = e && FS.unlinkIfPresent(engine.disabledMarkerURL)
+            markerPending = !e
+        }
+        requestedEnabled = enabled
+        writer.setEnabled(on)
+        engine.enabled = on
         // 同步建会话：init 返回后 log() 立即落盘
         let ok = engine.bootstrap()
         ctl.with { c in
@@ -103,7 +132,9 @@ public final class RetrieverClient: PlatformEventSink, @unchecked Sendable {
     // MARK: 启动（work 队列）
 
     private func startup() {
+        persistDisabledMarker()
         guard ctl.with({ $0.bootstrapped }) else { return }
+        engine.removePurgeLeftovers()
         engine.scanOutboxAtStartup()
         engine.recoverOldSessions()
         if let prev = engine.previousAppVersion, prev != engine.device.appVersion {
@@ -137,8 +168,9 @@ public final class RetrieverClient: PlatformEventSink, @unchecked Sendable {
         let enc = LineEncoder.encode(line)
         let out = writer.append(level: line.level, body: enc.body)
         if out.fatal {
-            // fatal：立即封段并物化，只落盘不尝试上传
-            onWorkSync { _ = self.engine.processSeals() }
+            // fatal：行已在返回前交给内核（R-1）、段已换；封段与物化投递到后台、不等待（ADR 0020 决定 1）。
+            // 进程随后死掉也不丢：下次启动的恢复从孤儿段物化出同一个确定性 batch_id。只落盘不尝试上传
+            work.async(qos: .userInitiated, flags: .enforceQoS) { [self] in _ = engine.processSeals() }
             return
         }
         if out.rotated {
@@ -162,9 +194,15 @@ public final class RetrieverClient: PlatformEventSink, @unchecked Sendable {
     }
 
     public func setUser(_ id: String?) {
-        if writer.setUser(Text.sanitizeUserId(id)) {
-            work.async { [self] in afterSeal() }
+        let r = writer.setUser(Text.sanitizeUserId(id))
+        guard r.changed else { return }
+        // 身份变了（与是否封段无关）：配置缓存按过期处理（放大型字段立即回落），并立即按新身份拉配置；
+        // 有在途请求则在途结束后再拉一次（ADR 0019 决定 12）
+        work.async { [self] in
+            engine.expireConfigForNewIdentity()
+            if r.rotated { afterSeal() } else { reschedule() }
         }
+        fetchConfig()
     }
 
     /// 「上报问题」：向当前段追加合成行（error / tag rtv.flush / synthetic，一定是义务行），立即封段并排空。
@@ -253,22 +291,93 @@ public final class RetrieverClient: PlatformEventSink, @unchecked Sendable {
     /// 生效的上传 / 本地级别（远程配置钳制后；适配器早过滤用）。
     public var effectiveLevels: (upload: LogLevel, local: LogLevel) { writer.levels }
 
+    /// 用户同意 / 撤回（ADR 0020 决定 2）：落盘为 root 同级的空标记文件 `<root>.disabled`，跨重启有效。
+    /// - false：先改内存（写入立即停），再在后台写标记；此后上传与拉配置都停（在途的那一个请求不取消）。
+    ///   标记写失败时内存照样禁用，每次调度 tick 重试。
+    /// - true：先删标记（调用线程上一次 unlink），删除失败 → 保持禁用；成功后排空、拉配置。
     public func setEnabled(_ enabled: Bool) {
-        writer.setEnabled(enabled)
+        enabledLock.lock()
+        requestedEnabled = enabled
+        if enabled {
+            guard FS.unlinkIfPresent(engine.disabledMarkerURL) else {
+                enabledLock.unlock()
+                return
+            }
+            markerPending = false
+            writer.setEnabled(true)
+        } else {
+            writer.setEnabled(false)
+            markerPending = true
+        }
+        enabledLock.unlock()
         work.async { [self] in
-            engine.enabled = enabled
-            if enabled { kickDrain() }
+            engine.enabled = writer.isEnabled
+            if engine.enabled {
+                kickDrain()
+                fetchConfig()
+            } else {
+                persistDisabledMarker()
+            }
+            reschedule()
         }
     }
 
-    /// 删 root 下全部内容并重建 install.json（新 install_id）与新会话。
+    /// 本进程的开关（内存；启动时从盘上标记初始化）。
+    public var isEnabled: Bool { writer.isEnabled }
+
+    /// 宿主在本实例上最后一次显式 setEnabled 的值（nil = 没调过）；共享实例换 root 时带给新实例。
+    var explicitEnabled: Bool? {
+        enabledLock.lock()
+        defer { enabledLock.unlock() }
+        return requestedEnabled
+    }
+
+    /// work 队列：把禁用写成标记（空文件，tmp → fsync → rename）。写的过程不持锁，写完按内存开关再对齐一次：
+    /// 其间宿主又 setEnabled(true) 的话，它的 unlink 可能早于这里的 rename。
+    func persistDisabledMarker() {
+        enabledLock.lock()
+        let want = markerPending && !writer.isEnabled
+        enabledLock.unlock()
+        guard want else { return }
+        let ok = FS.writeAtomic(engine.disabledMarkerURL, [])
+        enabledLock.lock()
+        if writer.isEnabled {
+            _ = FS.unlinkIfPresent(engine.disabledMarkerURL)
+        } else if ok {
+            markerPending = false
+        }
+        enabledLock.unlock()
+    }
+
+    /// 清空本地：删 root 下全部内容并重建 install.json（新 install_id）与新会话（ADR 0019 决定 9 / ADR 0020 决定 1）。
+    /// 调用线程只取消在途请求并置「清空中」（排空每次取批前检查并退出），删除与重建投递到后台、立即返回——
+    /// 返回时清空尚未完成，`installId` 在完成回调里才是新值。`purgeLocal()` 返回到清空完成之间写的行会随旧状态一起删除。
+    /// 禁用标记在 root 外面，不受影响；禁用时清空后不拉配置。
     public func purgeLocal() {
+        purge(completion: nil)
+    }
+
+    /// 同 `purgeLocal()`；清空与重建完成后在后台线程回调。
+    public func purgeLocal(completion: @escaping @Sendable () -> Void) {
+        purge(completion: completion)
+    }
+
+    private func purge(completion: (@Sendable () -> Void)?) {
+        ctl.with { $0.purging += 1 }
         transport.cancelAll()
-        onWorkSync { [self] in
-            writer.abandonSession()
+        work.async { [self] in
             engine.releaseUploadLock()
             engine.releaseSessionLock()
-            for name in FS.list(root) { FS.remove(root.appendingPathComponent(name)) }
+            // 先改名再删：一步原子，中途被杀也不会新旧状态混用。任何删除都发生在替代物（新 root、新 install、新会话）提交之后：
+            // 改名到 bootstrap 之间宿主 log() 的行照常写进旧会话（占 seq、绝不返回空结果），随旧状态一起删除；
+            // bootstrap 里的 startSession 把写入侧切到新 root（并关旧 fd）。
+            let moved = engine.moveRootAside()
+            if moved == nil {
+                // 改名失败（极少见，如 root 所在目录只读）：退回逐项删除——宁可失去原子性也要把本地数据清掉。
+                // 没有替代物可先提交：写入侧先放下当前会话（此间 log() 不落盘），删完再 bootstrap
+                writer.abandonSession()
+                for name in FS.list(root) { FS.remove(root.appendingPathComponent(name)) }
+            }
             engine.metas = [:]
             engine.embeddedDrops = []
             engine.embeddedClosed = []
@@ -285,13 +394,19 @@ public final class RetrieverClient: PlatformEventSink, @unchecked Sendable {
             engine.install = nil
             engine.current = nil
             let ok = engine.bootstrap()
+            // 新 root 没建成：不再往旧会话写（同未 bootstrap 的状态，由 retryBootstrap 重试），旧状态照删
+            if !ok { writer.abandonSession() }
+            if let moved { FS.remove(moved) }
             ctl.with { c in
                 c.bootstrapped = ok
                 c.installId = engine.install?.installId
                 c.sessionNo = engine.current?.meta.sessionNo ?? 0
+                c.purging -= 1
             }
+            fetchConfig()
+            reschedule()
+            if let completion { DispatchQueue.global(qos: .utility).async(execute: completion) }
         }
-        fetchConfig()
     }
 
     public var installId: String? { ctl.with { $0.installId } }
@@ -317,18 +432,19 @@ public final class RetrieverClient: PlatformEventSink, @unchecked Sendable {
         }
     }
 
-    /// 旧实例收尾（root / 进程名变化时由共享实例替换）。
+    /// 旧实例收尾（root / 进程名变化时由共享实例替换）：换段后把封段、放上传锁、关写句柄投递到后台，不等待（ADR 0020 决定 1）。
+    /// 收尾之前被杀也不丢：旧 root 里的会话由下次打开该 root 的实例当孤儿恢复。
     func shutdown() {
         writer.rotate(.shutdown)
-        onWorkSync { [self] in
-            _ = engine.processSeals()
-            engine.releaseUploadLock()
-        }
-        writer.abandonSession()
         ctl.with { c in
             c.closed = true
             c.timerTask?.cancel()
             c.timerTask = nil
+        }
+        work.async { [self] in
+            _ = engine.processSeals()
+            engine.releaseUploadLock()
+            writer.abandonSession()
         }
     }
 
@@ -484,12 +600,22 @@ public final class RetrieverClient: PlatformEventSink, @unchecked Sendable {
                     ctl.with { $0.lastStop = ("background_expired", nil) }
                     break loop
                 }
-                let step = await onWork { [self] in engine.nextSend() }
+                let step = await onWork { [self] () -> Engine.SendStep in
+                    // 清空中：排在前面的排空不再取批（在 work 队列上判断，与清空本身串行）
+                    if ctl.with({ $0.purging > 0 }) { return .stop(reason: "purging", wakeMono: nil) }
+                    return engine.nextSend()
+                }
                 switch step {
                 case .stop(let reason, let wake):
                     ctl.with { $0.lastStop = (reason, wake) }
                     break loop
                 case .send(let name, let req):
+                    if ctl.with({ $0.purging > 0 }) {
+                        // 取批之后、发出之前清空开始了：这一批要随 root 一起清掉，不发
+                        await onWork { [self] in if engine.inFlight == name { engine.inFlight = nil } }
+                        ctl.with { $0.lastStop = ("purging", nil) }
+                        break loop
+                    }
                     let resp = await transport.send(req)
                     let eff = await onWork { [self] in engine.handleResponse(name: name, response: resp) }
                     if eff.fetchConfig { fetchConfig() }
@@ -500,7 +626,7 @@ public final class RetrieverClient: PlatformEventSink, @unchecked Sendable {
                 reschedule()
             }
             let (again, waiters) = ctl.with { c -> (Bool, [CheckedContinuation<Void, Never>]) in
-                if c.rekick && !c.stopRequested {
+                if c.rekick && !c.stopRequested && c.purging == 0 {
                     c.rekick = false
                     return (true, [])
                 }
@@ -519,22 +645,38 @@ public final class RetrieverClient: PlatformEventSink, @unchecked Sendable {
 
     // MARK: 配置
 
+    /// 拉配置：同一时刻最多一个在途；在途时再来的请求置「待重拉」，在途结束后再拉一次（身份变化不被在途请求吞掉）。
+    /// 响应属于旧身份（已丢弃）时同样重拉。
     func fetchConfig() {
         let go = ctl.with { c -> Bool in
-            if c.configFetching || c.closed { return false }
+            if c.closed || c.purging > 0 { return false }
+            if c.configFetching {
+                c.configRefetch = true
+                return false
+            }
             c.configFetching = true
             return true
         }
         guard go else { return }
         Task.detached { [self] in
-            if let req = await onWork({ [self] in engine.configRequest() }) {
-                let resp = await transport.send(req)
-                let eff = await onWork { [self] in engine.applyConfigResponse(resp) }
-                if eff.sealed { kickDrain() }
-            } else {
-                await onWork { [self] in engine.lastConfigFetchMono = clock.monoMs() }
+            while true {
+                var stale = false
+                if let (req, identity) = await onWork({ [self] in engine.configRequest() }) {
+                    let resp = await transport.send(req)
+                    let eff = await onWork { [self] in engine.applyConfigResponse(resp, requestedFor: identity) }
+                    if eff.sealed { kickDrain() }
+                    stale = eff.stale
+                } else {
+                    await onWork { [self] in engine.lastConfigFetchMono = clock.monoMs() }
+                }
+                let again = ctl.with { c -> Bool in
+                    let more = (stale || c.configRefetch) && !c.closed && c.purging == 0
+                    c.configRefetch = false
+                    if !more { c.configFetching = false }
+                    return more
+                }
+                if !again { break }
             }
-            ctl.with { $0.configFetching = false }
             await onWork { [self] in reschedule() }
         }
     }
@@ -547,9 +689,12 @@ public final class RetrieverClient: PlatformEventSink, @unchecked Sendable {
         var cands: [Int64] = []
         if let d = writer.nextDeadline { cands.append(d) }
         if let u = engine.uploadWakeMono() { cands.append(u) }
-        if !engine.key.isEmpty {
+        if !engine.key.isEmpty && engine.enabled {
             cands.append((engine.lastConfigFetchMono ?? nowMono) + Int64(Limits.configPollIntervalS) * 1000)
         }
+        enabledLock.lock()
+        if markerPending { cands.append(nowMono + ClientConstants.markerRetryMs) }
+        enabledLock.unlock()
         if let c = engine.configCache?.nextChangeMono(nowWall: nowWall, nowMono: nowMono) { cands.append(c) }
         if let q = engine.nextQuarantineReleaseMono() { cands.append(q) }
         let next = cands.min()
@@ -580,6 +725,7 @@ public final class RetrieverClient: PlatformEventSink, @unchecked Sendable {
             c.timerTask = nil
             c.timerTarget = nil
         }
+        persistDisabledMarker()
         if writer.checkDeadlines() { _ = engine.processSeals() }
         engine.applyEffective()
         engine.releaseQuarantine(force: false)

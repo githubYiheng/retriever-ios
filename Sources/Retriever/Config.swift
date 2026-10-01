@@ -103,6 +103,12 @@ enum ConfigRules {
     }
 }
 
+/// 配置请求时的身份（ADR 0019 决定 12）：响应只在它仍等于当前身份时缓存并生效。
+struct ConfigIdentity: Equatable, Sendable {
+    var installId: String
+    var userId: String?
+}
+
 /// 生效配置：缓存 + 到期回落（§5）。
 struct EffectiveConfig: Equatable, Sendable {
     var config: RemoteConfig
@@ -118,6 +124,9 @@ struct ConfigCache: Sendable {
     var fetchedWallMs: Int64
     /// 本进程拉到时的单调时刻；从文件恢复的缓存为 nil（改用墙钟）。
     var fetchedMonoMs: Int64?
+    /// 身份（install_id, user_id）变了（ADR 0019 决定 12）：这份配置属于上一个身份，按过期处理直到新身份的响应到达
+    /// （新响应是新的缓存对象，标志随之清掉）。只在内存，不写进 config.json。
+    var identityStale = false
 
     func elapsedMs(nowWall: Int64, nowMono: Int64) -> Int64 {
         if let m = fetchedMonoMs { return nowMono - m }
@@ -126,6 +135,8 @@ struct ConfigCache: Sendable {
 
     /// 生效配置：过期后放大型字段（full_dump、低于宿主默认的 upload_level、高于默认的 context_*、
     /// 低于默认的 flush_interval、高于宿主默认的 local_cap）回落到宿主默认 / 内置默认（宪法 U-2）。
+    /// 只是身份过期（TTL 未到）时 local_cap 不回落：它决定本地已有数据的去留、不放大上传，回落会把超出宿主默认的义务批当
+    /// buffer_overflow 驱逐。
     static func effective(_ cache: ConfigCache?, host: HostDefaults, nowWall: Int64, nowMono: Int64) -> EffectiveConfig {
         guard let cache else {
             var c = ConfigRules.clamp([String: Any](), host: host)
@@ -134,7 +145,8 @@ struct ConfigCache: Sendable {
         }
         var c = cache.config
         let elapsed = cache.elapsedMs(nowWall: nowWall, nowMono: nowMono)
-        let expired = elapsed < 0 || elapsed >= Int64(c.ttlS) * 1000
+        let ttlExpired = elapsed < 0 || elapsed >= Int64(c.ttlS) * 1000
+        let expired = cache.identityStale || ttlExpired
         if expired {
             c.fullDump = false
             c.fullDumpTtlS = 0
@@ -142,7 +154,7 @@ struct ConfigCache: Sendable {
             if c.contextLines > Limits.ctxLinesDefault { c.contextLines = Limits.ctxLinesDefault }
             if c.contextBytes > Limits.ctxBytesDefault { c.contextBytes = Limits.ctxBytesDefault }
             if c.flushIntervalS < Limits.flushIntervalSDefault { c.flushIntervalS = Limits.flushIntervalSDefault }
-            if c.localCapBytes > host.localCapBytes { c.localCapBytes = host.localCapBytes }
+            if ttlExpired && c.localCapBytes > host.localCapBytes { c.localCapBytes = host.localCapBytes }
         }
         let fullDumpActive = c.fullDump && elapsed >= 0 && elapsed < Int64(c.fullDumpTtlS) * 1000
         return EffectiveConfig(config: c, fullDumpActive: fullDumpActive,
@@ -151,6 +163,7 @@ struct ConfigCache: Sendable {
 
     /// 下一次生效配置可能变化的单调时刻（过期 / full_dump 到期），供调度器唤醒。
     func nextChangeMono(nowWall: Int64, nowMono: Int64) -> Int64? {
+        if identityStale { return nil }
         let elapsed = elapsedMs(nowWall: nowWall, nowMono: nowMono)
         var cands: [Int64] = []
         let ttl = Int64(config.ttlS) * 1000

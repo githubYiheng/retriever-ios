@@ -34,6 +34,41 @@ final class GoldenTests: XCTestCase {
         }
     }
 
+    /// 413 半批 batch_id（ADR 0019 决定 11）：name = `<install>:<session>:primary:<oseq_from>:<oseq_to>`，与未切分批必不同名。
+    func testSplitBatchId() throws {
+        let g = try Repo.golden("ids.json")
+        let vs = try XCTUnwrap(g["split_batch_id"] as? [[String: Any]])
+        XCTAssertGreaterThan(vs.count, 0)
+        for v in vs {
+            let iid = v["install_id"] as! String
+            let sid = v["session_id"] as! String
+            let (f, t) = (int(v["oseq_from"]), int(v["oseq_to"]))
+            XCTAssertEqual(IDs.splitBatchIdName(installId: iid, sessionId: sid, oseqFrom: f, oseqTo: t), v["name"] as? String)
+            XCTAssertEqual(IDs.splitBatchId(installId: iid, sessionId: sid, oseqFrom: f, oseqTo: t), v["expect"] as? String)
+            XCTAssertNotEqual(IDs.splitBatchId(installId: iid, sessionId: sid, oseqFrom: f, oseqTo: t),
+                              IDs.batchId(installId: iid, sessionId: sid, kind: .primary, n: f))
+        }
+        XCTAssertNil(IDs.splitBatchId(installId: "x", sessionId: IDs.newV4(), oseqFrom: 1, oseqTo: 2))
+        XCTAssertNil(IDs.splitBatchId(installId: IDs.newV4(), sessionId: IDs.newV4(), oseqFrom: 3, oseqTo: 2))
+    }
+
+    /// 整数 attrs（ADR 0020 决定 3）：`AttrValue.int` 在行 JSON 里的字面量与 golden（两端逐字节相同）一致；
+    /// |v| ≤ 2^53 − 1 → 数字，否则 → 十进制字符串，不打 truncated。iOS 只有 Int64，跳过 fits = big 的向量。
+    func testIntAttrs() throws {
+        let g = try Repo.golden("attrs.json")
+        XCTAssertEqual(g["max_safe_integer"] as? String, "9007199254740991")
+        let vs = try XCTUnwrap(g["int_attr"] as? [[String: Any]])
+        var checked = 0
+        for v in vs where v["fits"] as? String == "int64" {
+            let value = try XCTUnwrap(Int64(v["value"] as! String))
+            let (json, truncated) = LineEncoder.encodeAttrs(["k": .int(value)])
+            XCTAssertEqual(json.map { String(decoding: $0, as: UTF8.self) }, "{\"k\":\(v["json"] as! String)}", "\(value)")
+            XCTAssertFalse(truncated)
+            checked += 1
+        }
+        XCTAssertGreaterThan(checked, 0)
+    }
+
     /// backfill 切分 batch_id（三段 name）：与 `uuidv5(ns, "<install>:<session>:backfill:<seg_no>:<seq_from>")` 一致。
     func testBackfillSplitBatchIdName() {
         let iid = "3f2c9a4e-8b1d-4c7a-9e5f-0a1b2c3d4e5f"

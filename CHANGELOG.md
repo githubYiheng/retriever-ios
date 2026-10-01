@@ -3,6 +3,38 @@
 本仓库（`githubYiheng/retriever-ios`）是 Retriever monorepo `sdk/ios` 的只读发布镜像（`git subtree split`）；
 改动一律回 monorepo。版本号遵循语义化版本：修订号 = 只修 bug；次版本 = 公开 API 只增；主版本 = 公开 API 有减或改。
 
+## [0.2.0] - 2026-10-01
+
+遗留修复批（ADR 0019「本地状态自带真实归属」、ADR 0020「宿主线程不等待 SDK」）。公开 API 只增；盘上新增可选键与 root 同级文件，0.1.x 留下的状态全部照读（原地升级，不需要迁移）；信封字段不变。
+
+### 默认行为变化（升级前请读）
+- **`log(.fatal)` 不再阻塞调用线程**（含 `RetrieverLogger.fault`、swift-log `critical`）：行仍在返回前落盘，封段与物化改在后台；进程随后死掉，下次启动恢复出同一批。
+- **`purgeLocal()` 不再阻塞调用线程**：返回时清空尚未完成，新的 `installId` 要在新增的 `purgeLocal(completion:)` 回调里读；返回到清空完成之间写的行随旧状态一起删除。
+- **`setEnabled(false)` 跨重启持久**：落盘为 root 同级的标记文件 `<root>.disabled`，直到 `setEnabled(true)`；禁用期间也不再拉配置。把它当「临时暂停」、指望重启恢复的宿主会变成一直禁用。
+- **`RetrieverLogger` 写系统日志默认 `.private`**：Console.app / sysdiagnose 里显示 `<private>`；要明文用新的 `publicSystemLog: true`。Retriever 那一路不变。
+- **`Options.appGroup` 暂不支持生产**：挂起时会持有组容器里的文件锁，可能被系统以 `0xdead10cc` 终止（重构另立 ADR）。
+- 换 root / 进程名的 `configure` 不再在共享锁内等旧实例收尾（旧实例的封段在后台完成）。
+
+### 新增
+- `Retriever.isEnabled`（只读）；`Retriever.purgeLocal(completion:)`（后台线程回调）。
+- `AttrValue.int(_ v: Int64)`：|v| ≤ 2^53 − 1 → 数字，超出 → 十进制字符串（静态工厂，不是新 case，宿主的穷举 switch 不受影响）。
+- `RetrieverLogger(subsystem:category:publicSystemLog:)`。
+- 隐私清单补 Device ID（install_id；关联用户、不用于跟踪，用途 App Functionality）——宿主同步 App Store Connect 隐私标签。
+
+### 修复
+- **会话终态被挤掉**：终态只为有义务行的会话写（空会话不再写，恢复时零行的会话目录直接删）；每批按文件顺序带最旧的 20 条，带不完留给下一批，不再删除更旧的、不再发 `closed_sessions_dropped`；`sessions.jsonl` 上限 1000 条，超出删最旧的未在途条目。
+- **墓碑有损合并**：每批按文件顺序带最旧的 100 条，不合并、不改写文件；`drops.jsonl` 超 1000 条只做无损合并（同会话、同 reason、区间相接），仍超出删最旧的未在途条目——并宽不再盖住真实缺口、不再跨会话归属。
+- **install.json 损坏后换新 id、旧状态挂错归属**：每个会话 `meta.json` 增可选键 `install_id`；损坏时从 meta 修复身份（不换 id、计数续上，合成 warn `rtv.install_repaired`）；没有任何副本（只在 0.1.x 升上来的首次启动恰逢损坏时可达）才清空后新建（合成 warn `rtv.install_reset`，attrs 带作废的批数 / 会话数）；有 meta 读不了按「读不了」处理，稍后重试。
+- **清空不原子**：`purgeLocal` 与上一条的清空都先把 root 改名为同级 `<root>.purge-<uuid>` 再删，启动时清掉残留。
+- **旧批以当前 install 上报被服务端隔离**：请求头 `X-Rtv-Install` 取批自身信封；`mapping.json` 只在 `status == "stored"` 且批属于当前 install 时记为已确认（隔离回的 200 不再让映射推迟 24 h）。
+- **413 切分可能静默丢后半批**：半批改用新 batch_id（UUIDv5 `…:primary:<oseq_from>:<oseq_to>`），全部写成后才删原批；任一半写失败则删掉已写的、原批原样保留。
+- **setUser 不重拉配置**：值变化即按新身份拉配置（在途请求结束后再拉一次，不被吞掉）；身份变化的那一刻缓存按过期处理，上一个用户的放大型覆盖立即回落；请求发出后身份又变了的响应丢弃。
+- **恢复时段读不出就删会话**：改为不推进 cursor、不删目录、不写终态，下次启动重试。恢复时终态没写成（磁盘满等）也不再照样标记已收尾，下次启动重试。
+- **jsonl 追加到一半失败留下半行**（连累下一条被丢）：失败时截回追加前的长度。
+- attrs 的超长字符串值先截到预算再转义（结果不变，不再为几 MB 的值整串转义）。
+- 禁用状态下恢复旧会话不再合成 `rtv.unclean_exit`（合成行也是写入）；禁用期间启动的零行会话重新启用后不补报（目录直接删）。
+- 413 切分写不出时按普通失败退避（`http_413`，不计毒批），不再每 2 s 重发。
+
 ## [0.1.4] - 2026-09-30
 
 宿主发版前审查（`docs/audit/2026-09-30-prerelease/`）的 5 处 SDK 缺陷；磁盘文件格式与线协议不变。

@@ -1,7 +1,7 @@
 // 只给测试用（真杀进程验收 R-1，方案 §3.11）：用给定 root 写 N 行（含 warn / error），
-// 可选在最后写半行（模拟撕裂的 write），然后 SIGKILL 自己——不给任何收尾机会。
+// 可选在最后写半行（模拟撕裂的 write）或一条 fatal（封段物化只投递到后台，ADR 0020），然后立刻 SIGKILL 自己——不给任何收尾机会。
 //
-//   RetrieverKillHelper --root <dir> [--n 5000] [--torn] [--process main]
+//   RetrieverKillHelper --root <dir> [--n 5000] [--torn] [--fatal] [--process main]
 import Foundation
 @_spi(RetrieverTesting) import Retriever
 
@@ -24,6 +24,7 @@ struct HeadlessPlatform: PlatformHooks {
 var root: String?
 var n = 5000
 var torn = false
+var fatal = false
 var process = "main"
 var args = CommandLine.arguments.dropFirst().makeIterator()
 while let a = args.next() {
@@ -31,12 +32,13 @@ while let a = args.next() {
     case "--root": root = args.next()
     case "--n": n = Int(args.next() ?? "") ?? n
     case "--torn": torn = true
+    case "--fatal": fatal = true
     case "--process": process = args.next() ?? process
     default: break
     }
 }
 guard let root else {
-    FileHandle.standardError.write("usage: RetrieverKillHelper --root <dir> [--n N] [--torn]\n".data(using: .utf8)!)
+    FileHandle.standardError.write("usage: RetrieverKillHelper --root <dir> [--n N] [--torn] [--fatal]\n".data(using: .utf8)!)
     exit(2)
 }
 
@@ -57,6 +59,10 @@ if torn, let path = client.debugOpenSegmentPath {
     let fd = open(path, O_WRONLY | O_APPEND)
     _ = half.withCString { write(fd, $0, strlen($0)) }
     close(fd)
+}
+if fatal {
+    // log() 返回时这一行已交给内核；紧接着被杀，后台的封段物化来不及也不丢
+    client.log(.fatal, "fatal line", tag: "kill")
 }
 // 输出计数给测试核对，然后自杀
 let c = client.debugCounters

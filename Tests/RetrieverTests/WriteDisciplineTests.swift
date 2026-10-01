@@ -128,6 +128,31 @@ final class WriteDisciplineTests: XCTestCase {
         XCTAssertEqual(ls.count, 2)
     }
 
+    /// jsonl 追加到一半失败（ADR 0019 决定 5）：截回追加前的长度，半行不和下一条粘连（修复前：两条一起被读侧丢掉）。
+    /// 用 RLIMIT_FSIZE 卡在追加中途：write 先写进一部分，再返回 EFBIG（SIGXFSZ 忽略）；窗口只包住这一次追加。
+    /// （Darwin 对新开的 O_APPEND fd 按 fd 偏移 0 核上限：上限 = 原长时，这次追加只写进前「原长」字节；截回原长不超上限。）
+    func testJsonlAppendFailureTruncatesBack() throws {
+        let url = makeTempDir("rtv-append").appendingPathComponent("drops.jsonl")
+        XCTAssertTrue(FS.append(url, Array("{\"a\":1}\n".utf8)))
+        let before = try XCTUnwrap(FS.size(url))
+        let entry = JSONL.encodeDrops([DropEntry(sessionId: IDs.newV4(), oseqFrom: 2, oseqTo: 3, n: 2, reason: "write_failed",
+                                                 atMs: 2, lastAckAgeMs: -1)])
+        XCTAssertGreaterThan(Int64(entry.count), before)
+        let oldHandler = signal(SIGXFSZ, SIG_IGN)
+        var old = rlimit()
+        getrlimit(RLIMIT_FSIZE, &old)
+        var lim = old
+        lim.rlim_cur = rlim_t(before)
+        setrlimit(RLIMIT_FSIZE, &lim)
+        let ok = FS.append(url, entry)
+        setrlimit(RLIMIT_FSIZE, &old)
+        signal(SIGXFSZ, oldHandler)
+        XCTAssertFalse(ok)
+        XCTAssertEqual(FS.size(url), before, "截回追加前的长度，不留半行")
+        XCTAssertTrue(FS.append(url, entry))
+        XCTAssertEqual(JSONL.read(url).count, 2, "下一条不被半行连累")
+    }
+
     func testConcurrentLoggingKeepsSeqUnique() throws {
         let h = Harness(key: "")
         let c = h.client

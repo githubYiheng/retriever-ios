@@ -55,6 +55,42 @@ final class RetrieverLoggerTests: XCTestCase {
         XCTAssertEqual(rec.calls.map(\.0), [.warn, .fatal])
     }
 
+    final class SysRec: @unchecked Sendable {
+        let lock = NSLock()
+        var calls: [(RetrieverLogger.SystemLevel, String, Bool)] = []
+        func add(_ c: (RetrieverLogger.SystemLevel, String, Bool)) { lock.lock(); calls.append(c); lock.unlock() }
+    }
+
+    /// 系统日志那一路默认 `.private`（ADR 0020 决定 5）；`publicSystemLog: true` 才 `.public`；低于 localLevel 的行系统日志照写。
+    func testSystemLogPrivateByDefault() {
+        XCTAssertFalse(RetrieverLogger(subsystem: "com.example.bff", category: "billing").publicSystemLog)
+        XCTAssertTrue(RetrieverLogger(subsystem: "com.example.bff", category: "billing", publicSystemLog: true).publicSystemLog)
+        let rec = Rec()
+        rec.local = .fatal
+        let sys = SysRec()
+        let priv = RetrieverLogger(subsystem: "com.example.bff", category: "billing", emit: { rec.add(($0, $1, $2, $3, $4)) },
+                                   localLevel: { rec.lock.withLock { rec.local } }, systemLog: { sys.add(($0, $1, $2)) })
+        priv.debug("d")
+        priv.info("i")
+        priv.notice("n")
+        priv.warning("w")
+        priv.error("e")
+        priv.fault("f")
+        XCTAssertEqual(sys.calls.map(\.0), [.debug, .info, .notice, .warning, .error, .fault])
+        XCTAssertEqual(sys.calls.map(\.1), ["d", "i", "n", "w", "e", "f"])
+        XCTAssertTrue(sys.calls.allSatisfy { !$0.2 }, "默认私有")
+        XCTAssertEqual(rec.calls.map(\.0), [.fatal], "Retriever 那一路照旧按 localLevel 早过滤")
+        let pubSys = SysRec()
+        let pub = RetrieverLogger(subsystem: "com.example.bff", category: "billing", publicSystemLog: true,
+                                  emit: { rec.add(($0, $1, $2, $3, $4)) }, localLevel: { .debug }, systemLog: { pubSys.add(($0, $1, $2)) })
+        pub.error("static text")
+        XCTAssertEqual(pubSys.calls.map(\.2), [true])
+        // 真实 os.Logger 路径（两支）能走通
+        RetrieverLogger(subsystem: "com.example.bff", category: "billing", emit: { _, _, _, _, _ in }, localLevel: { .fatal }).info("private")
+        RetrieverLogger(subsystem: "com.example.bff", category: "billing", publicSystemLog: true, emit: { _, _, _, _, _ in },
+                        localLevel: { .fatal }).info("public")
+    }
+
     /// 端到端：经真实实例落盘，exc / tag / attrs 形状正确。
     func testEndToEndIntoSegment() throws {
         let h = Harness(key: "")

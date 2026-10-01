@@ -69,15 +69,20 @@ final class Engine: @unchecked Sendable {
     var batchesWritten = 0
     var todayDay = ""
     var todayCount = 0
+    /// 本进程内存开关（work 队列上的副本：调度、恢复合成行用）；上传 / 拉配置的决策读写入侧的开关并看盘上标记（`uploadAllowed`）。
     var enabled = true
     var previousAppVersion: String?
     var protectedDataUnavailable = false
+    /// 禁用标记：root **同级**的空文件 `<root>.disabled`，存在 = 禁用（ADR 0020 决定 2）。
+    /// 放在 root 外面，清空 root 不可能顺手把它带走；多进程共享。
+    let disabledMarkerURL: URL
 
     init(root: URL, processName: String, key: String, baseURL: URL, options: Options,
          clock: any Clock, platform: any PlatformHooks, writer: Writer) {
         self.root = root
         self.procDir = root.appendingPathComponent("proc-\(processName)")
         self.outboxDir = root.appendingPathComponent("outbox")
+        self.disabledMarkerURL = Engine.sibling(of: root, suffix: ".disabled")
         self.processName = processName
         self.clock = clock
         self.platform = platform
@@ -106,22 +111,46 @@ final class Engine: @unchecked Sendable {
 
     var sdkHeader: String { "retriever-ios/\(sdkVersion)" }
 
+    /// root 同级的路径：`<root> + suffix`（禁用标记 `.disabled`、清空中的 `.purge-<uuid>`）。
+    static func sibling(of root: URL, suffix: String) -> URL {
+        root.deletingLastPathComponent().appendingPathComponent(root.lastPathComponent + suffix)
+    }
+
+    /// 上传 / 拉配置的开关 = 本进程内存开关 ∧ 盘上没有禁用标记（每次决策 stat 一次；别的进程写的标记下一次决策就看到）。
+    /// 内存开关读写入侧那一个（setEnabled 在调用线程上同步改它）：`enabled` 副本要等 work 队列轮到才对齐，
+    /// 排在它前面的取批 / 拉配置不能按滞后的「启用」发出请求。
+    func uploadAllowed() -> Bool {
+        writer.isEnabled && !FS.exists(disabledMarkerURL)
+    }
+
     // MARK: 启动（同步：log() 在 init 返回后立即可用）
 
-    /// 建目录、install.json（首次生成 O_EXCL 临时文件 → fsync → rename，失败方重读；损坏则重建并留痕）、计数器 +1、新会话。
+    /// install.json 的读改写结果。
+    struct InstallOutcome {
+        var install: InstallInfo
+        var sessionNo: Int64
+        /// 刚从会话 meta 修复了身份。
+        var repaired: Bool
+        /// install.json 损坏且没有任何带 install_id 的 meta：容器无法归属，已清空后新建（作废的出站箱批数 / 会话目录数）。
+        var discarded: (batches: Int, sessions: Int)?
+    }
+
+    /// 建目录、install.json（首次生成 O_EXCL 临时文件 → fsync → rename，失败方重读；损坏则从会话 meta 修复身份，
+    /// 无副本则清空后新建，均留痕）、计数器 +1、新会话。
     @discardableResult
     func bootstrap() -> Bool {
         guard FS.ensureDir(root), FS.ensureDir(procDir), FS.ensureDir(outboxDir) else { return false }
         FS.excludeFromBackup(root)
-        let result: (InstallInfo, Int64, Bool)? = FS.withDirLock(root) { bumpInstallLocked() }
-        guard let (inst, sessionNo, reset) = result else { return false }
+        guard let outcome = FS.withDirLock(root, { bumpInstallLocked() }) else { return false }
+        let inst = outcome.install
         install = inst
         let now = clock.wallMs()
         let sid = IDs.newV4()
         let dir = procDir.appendingPathComponent(sid)
         guard FS.ensureDir(dir) else { return false }
         lockSessionDir(dir)
-        let meta = SessionMeta(sessionId: sid, sessionNo: sessionNo, startedMs: now, device: device, process: processName)
+        let meta = SessionMeta(sessionId: sid, sessionNo: outcome.sessionNo, startedMs: now, device: device, process: processName,
+                               installId: inst.installId)
         FS.writeAtomic(dir.appendingPathComponent("meta.json"), meta.encode())
         let cursor = Cursor(lastState: platform.isForeground().map { $0 ? "fg" : "bg" }, lastStateMs: now)
         let rec = SessionRecord(meta: meta, dir: dir, cursor: cursor, sealed: [])
@@ -129,13 +158,37 @@ final class Engine: @unchecked Sendable {
         writeCursor(rec)
         writer.startSession(dir: dir, sessionId: sid)
         loadPersistentState()
-        if reset {
-            // install_id 换了：新会话里留一条合成行（同 rtv.flush 的合成机制），排障时看得见
-            let enc = LineEncoder.encode(LogLine(ts: now, level: .warn, msg: "install.json unreadable; install_id regenerated",
-                                                 tag: "rtv.install_reset"), synthetic: true)
-            _ = writer.append(level: .warn, body: enc.body)
+        // install.json 出过事：新会话里留一条合成行（同 rtv.flush 的合成机制），排障时看得见
+        if outcome.repaired {
+            appendSynthetic(now: now, tag: "rtv.install_repaired", msg: "install.json unreadable; identity repaired from session meta")
+        }
+        if let d = outcome.discarded {
+            appendSynthetic(now: now, tag: "rtv.install_reset", msg: "install.json unreadable; local state discarded",
+                            attrs: ["batches": .int(Int64(d.batches)), "sessions": .int(Int64(d.sessions))])
         }
         return true
+    }
+
+    private func appendSynthetic(now: Int64, tag: String, msg: String, attrs: [String: AttrValue]? = nil) {
+        let enc = LineEncoder.encode(LogLine(ts: now, level: .warn, msg: msg, tag: tag, attrs: attrs), synthetic: true)
+        _ = writer.append(level: .warn, body: enc.body)
+    }
+
+    /// 清空（ADR 0019 决定 9）的第一步：把整个 root 改名为同级的 `<root>.purge-<uuid>`（一步原子：新旧状态不可能混用），
+    /// 之后的递归删除只碰改过名的目录。改名后、删完前被杀：root 已不存在，下次 bootstrap 建新 root，残留由 `removePurgeLeftovers` 清掉。
+    /// 返回改名后的目录；改名失败返回 nil（root 原样还在）。
+    func moveRootAside() -> URL? {
+        let dst = Engine.sibling(of: root, suffix: ".purge-" + IDs.newV4())
+        return rename(root.path, dst.path) == 0 ? dst : nil
+    }
+
+    /// 启动时清掉清空中途被杀留下的 `<root>.purge-*`（work 队列上，不占宿主线程）。
+    func removePurgeLeftovers() {
+        let parent = root.deletingLastPathComponent()
+        let prefix = root.lastPathComponent + ".purge-"
+        for name in FS.list(parent) where name.hasPrefix(prefix) {
+            FS.remove(parent.appendingPathComponent(name))
+        }
     }
 
     func lockSessionDir(_ dir: URL) {
@@ -157,34 +210,87 @@ final class Engine: @unchecked Sendable {
         if sessionLockFd >= 0 { flock(sessionLockFd, LOCK_UN); close(sessionLockFd) }
     }
 
-    /// 返回 (install, session_no, 是否因损坏而重建)。
-    private func bumpInstallLocked() -> (InstallInfo, Int64, Bool)? {
+    /// install.json 读改写（调用方持有 root 目录锁）；nil = 本次失败、稍后 retryBootstrap。
+    private func bumpInstallLocked() -> InstallOutcome? {
         var inst: InstallInfo
-        var reset = false
+        var repaired = false
+        var discarded: (batches: Int, sessions: Int)?
         if let b = FS.read(installURL) {
             if let i = InstallInfo.decode(b) {
                 inst = i
             } else {
-                // 读到了（含 0 字节）却解析不了 = 损坏：原子重建，否则此后每次 bootstrap 都失败、SDK 永久静默。
-                // 读不全（大小对不上）不算损坏，按读失败处理
-                guard Int64(b.count) == FS.size(installURL), let rebuilt = createInstallLocked(replacing: true) else { return nil }
-                inst = rebuilt
-                reset = true
+                // 读到了（含 0 字节）却解析不了 = 损坏。读不全（大小对不上）不算损坏，按读失败处理
+                guard Int64(b.count) == FS.size(installURL) else { return nil }
+                // install_id 是「这一份数据容器」的身份，单个文件损坏不改变容器：从会话 meta 的冗余副本修复、不换 id，
+                // 其余状态全部继续有效（ADR 0019 决定 7）。扫描本身失败（有 meta 读不了等）→ 本次失败，绝不重建
+                guard let evidence = scanIdentityLocked() else { return nil }
+                if let (id, counter, created) = evidence.identity {
+                    // created_ms 取该 id 下最早会话的 started_ms（与 Android 同口径；本地字段，不上传）
+                    inst = InstallInfo(installId: id, sessionCounter: counter, createdMs: created)
+                    repaired = true
+                } else {
+                    // 无副本（只在 0.1.x 升上来的首次启动恰逢损坏时可达）：清空后在空 root 里新建 install（ADR 0019 决定 8 / 9）
+                    guard discardRootLocked(), let created = createInstallLocked() else { return nil }
+                    inst = created
+                    discarded = (evidence.batches, evidence.sessions)
+                }
             }
         } else {
             // 读不到：不存在则创建；存在但读不了（首次解锁前 / 权限）则本次失败、稍后 retryBootstrap——
             // 绝不在这里重建，否则首次解锁前启动会换掉 install_id
-            guard let created = createInstallLocked(replacing: false) else { return nil }
+            guard let created = createInstallLocked() else { return nil }
             inst = created
         }
         inst.sessionCounter += 1
         guard FS.writeAtomic(installURL, inst.encode()) else { return nil }
-        return (inst, inst.sessionCounter, reset)
+        return InstallOutcome(install: inst, sessionNo: inst.sessionCounter, repaired: repaired, discarded: discarded)
     }
 
-    /// 新 install（新 install_id、计数器 0）：O_EXCL 临时文件 → fsync → rename。`replacing == false` 时目标已存在就放弃
-    /// （并发的另一方已写）；`replacing == true` 覆盖损坏的 install.json。调用方持有 root 目录锁。
-    private func createInstallLocked(replacing: Bool) -> InstallInfo? {
+    /// 无副本时的清空（ADR 0019 决定 8 / 9，与 purgeLocal 同为「先改名再删」）：在 root 目录锁内把 root 改名移走、重建空目录，
+    /// 不与另一进程的 bootstrap 交错。改走的旧 root 由随后的 startup（work 队列）的 `removePurgeLeftovers` 删，不占宿主线程。
+    /// 调用方持有 root 目录锁。
+    private func discardRootLocked() -> Bool {
+        guard moveRootAside() != nil, FS.ensureDir(root), FS.ensureDir(procDir), FS.ensureDir(outboxDir) else { return false }
+        FS.excludeFromBackup(root)
+        return true
+    }
+
+    /// install.json 损坏时的身份证据（ADR 0019 决定 7 / 8）：扫全部 `proc-*/<sid>/meta.json`，取 `started_ms` 最大且带
+    /// `install_id` 的那个 id，会话计数器 = 该 id 下最大的 `session_no`；顺带数出作废时要写进合成行的出站箱批数与会话目录数。
+    /// 目录列不出、有 meta 存在却读不了 → nil（同「install.json 读不了」）。调用方持有 root 目录锁。
+    private func scanIdentityLocked() -> (identity: (String, Int64, Int64)?, batches: Int, sessions: Int)? {
+        guard let procs = FS.listStrict(root) else { return nil }
+        var latest: SessionMeta?
+        var maxNo: [String: Int64] = [:]
+        var minStarted: [String: Int64] = [:]
+        var sessions = 0
+        for p in procs where p.hasPrefix("proc-") {
+            let pdir = root.appendingPathComponent(p)
+            guard let sids = FS.listStrict(pdir) else { return nil }
+            for sid in sids where IDs.isUuid(sid) {
+                sessions += 1
+                let url = pdir.appendingPathComponent(sid).appendingPathComponent("meta.json")
+                if access(url.path, F_OK) != 0 {
+                    if errno == ENOENT { continue }
+                    return nil
+                }
+                // 读不全（读到一半出错，FS.read 交回截短的缓冲）同读不了：截短的 meta 会被当成「解析不了」跳过，误判无副本而清空
+                guard let b = FS.read(url), Int64(b.count) == FS.size(url) else { return nil }
+                // 解析不了 / 0.1.x 写的无 install_id 的 meta：不当副本
+                guard let m = SessionMeta.decode(b), let iid = m.installId else { continue }
+                maxNo[iid] = max(maxNo[iid] ?? 0, m.sessionNo)
+                minStarted[iid] = min(minStarted[iid] ?? Int64.max, m.startedMs)
+                if latest == nil || m.startedMs > latest!.startedMs { latest = m }
+            }
+        }
+        let batches = FS.list(outboxDir).filter { OutboxName.parse($0) != nil }.count
+        let identity = latest.flatMap { m in m.installId.map { ($0, maxNo[$0] ?? m.sessionNo, minStarted[$0] ?? m.startedMs) } }
+        return (identity, batches, sessions)
+    }
+
+    /// 新 install（新 install_id、计数器 0）：O_EXCL 临时文件 → fsync → rename；目标已存在就放弃（并发的另一方已写）。
+    /// 调用方持有 root 目录锁。
+    private func createInstallLocked() -> InstallInfo? {
         let info = InstallInfo(installId: IDs.newV4(), sessionCounter: 0, createdMs: clock.wallMs())
         let tmp = root.appendingPathComponent(".install.json.tmp-\(getpid())")
         unlink(tmp.path)
@@ -194,7 +300,7 @@ final class Engine: @unchecked Sendable {
             let bytes = info.encode()
             let ok = bytes.withUnsafeBytes { FS.writeAll(fd, $0) } && fsync(fd) == 0
             close(fd)
-            if ok && (replacing || !FS.exists(installURL)) && rename(tmp.path, installURL.path) == 0 {
+            if ok && !FS.exists(installURL) && rename(tmp.path, installURL.path) == 0 {
                 FS.markFile(installURL)
             } else {
                 unlink(tmp.path)
@@ -269,7 +375,7 @@ final class Engine: @unchecked Sendable {
         return batchesWritten != before
     }
 
-    // MARK: 墓碑（drops.jsonl：追加写，上限 1000 条超出按 reason 合并）
+    // MARK: 墓碑与会话终态（drops.jsonl / sessions.jsonl：追加写，各自上限 1000 条；ADR 0019 决定 3 / 4）
 
     func lastAckAge(_ at: Int64) -> Int64 {
         backoff.lastAckMs < 0 ? -1 : max(0, at - backoff.lastAckMs)
@@ -286,6 +392,7 @@ final class Engine: @unchecked Sendable {
         if !appendDrops(entries) { writer.putBackFailed(failed) }
     }
 
+    /// 追加墓碑；文件超过上限先无损合并，仍超出删最旧的未在途条目（服务端显示为无解释缺口，大声方向）。
     @discardableResult
     func appendDrops(_ entries: [DropEntry]) -> Bool {
         guard !entries.isEmpty else { return true }
@@ -293,11 +400,23 @@ final class Engine: @unchecked Sendable {
             guard FS.append(dropsURL, JSONL.encodeDrops(entries)) else { return false }
             let all = readDropsLocked()
             if all.count > ClientConstants.dropsFileMaxEntries {
-                // 已嵌进出站箱批次的条目原样保留（2xx 后按原样删除），其余合并
-                let embedded = all.filter { embeddedDrops.contains($0) }
-                let rest = all.filter { !embeddedDrops.contains($0) }
-                let merged = Engine.mergeDrops(rest, limit: max(1, ClientConstants.dropsFileMaxEntries - embedded.count))
-                FS.writeAtomic(dropsURL, JSONL.encodeDrops(embedded + merged))
+                let merged = Engine.mergeDropsLossless(all, keep: embeddedDrops)
+                FS.writeAtomic(dropsURL, JSONL.encodeDrops(
+                    Engine.dropOldest(merged, over: ClientConstants.dropsFileMaxEntries) { embeddedDrops.contains($0) }))
+            }
+            return true
+        }
+    }
+
+    /// 追加一条会话终态；文件超过上限删最旧的未在途条目（这些会话在服务端归 unknown，不误报）。
+    @discardableResult
+    func appendClosed(_ c: ClosedSession) -> Bool {
+        FS.withDirLock(root) {
+            guard FS.append(sessionsURL, JSONL.encodeClosed([c])) else { return false }
+            let all = readClosedLocked()
+            if all.count > ClientConstants.sessionsFileMaxEntries {
+                FS.writeAtomic(sessionsURL, JSONL.encodeClosed(
+                    Engine.dropOldest(all, over: ClientConstants.sessionsFileMaxEntries) { embeddedClosed.contains($0.sessionId) }))
             }
             return true
         }
@@ -311,31 +430,84 @@ final class Engine: @unchecked Sendable {
         JSONL.read(sessionsURL).compactMap(ClosedSession.decode)
     }
 
-    /// 按 reason 合并计数：先按 (session_id, reason) 合并区间，仍超限再按 reason 合并。
-    static func mergeDrops(_ entries: [DropEntry], limit: Int) -> [DropEntry] {
-        if entries.count <= limit { return entries }
-        func merge(_ es: [DropEntry], key: (DropEntry) -> String) -> [DropEntry] {
-            var order: [String] = []
-            var acc: [String: DropEntry] = [:]
-            for e in es {
-                let k = key(e)
-                if var m = acc[k] {
-                    m.oseqFrom = min(m.oseqFrom, e.oseqFrom)
-                    m.oseqTo = max(m.oseqTo, e.oseqTo)
-                    m.n += e.n
-                    m.atMs = max(m.atMs, e.atMs)
-                    m.lastAckAgeMs = max(m.lastAckAgeMs, e.lastAckAgeMs)
-                    acc[k] = m
+    /// 超出 limit 时按文件顺序删最旧的条目；在途（已嵌进出站箱批次、2xx 后按原样删除）的不删。
+    static func dropOldest<T>(_ entries: [T], over limit: Int, inFlight: (T) -> Bool) -> [T] {
+        var excess = entries.count - limit
+        guard excess > 0 else { return entries }
+        var out: [T] = []
+        out.reserveCapacity(limit)
+        for e in entries {
+            if excess > 0 && !inFlight(e) {
+                excess -= 1
+                continue
+            }
+            out.append(e)
+        }
+        return out
+    }
+
+    /// 无损合并（ADR 0019 决定 4）：同会话、同 reason、区间相接或重叠的并成一条，n = 并集长度；`backfill_evicted` 同会话 n 相加。
+    /// 保持不变式「每条非 backfill 墓碑 n == oseq_to − oseq_from + 1、session_id 是真实归属」：并宽只发生在真的相接处，
+    /// 绝不盖住缺口。在途条目与不满足该不变式的旧条目（0.1.x 有损合并留下的）原样保留、不参与合并。
+    /// 合并出的条目放在它最早一个成员的位置，其余条目保持文件顺序。
+    static func mergeDropsLossless(_ entries: [DropEntry], keep: Set<DropEntry>) -> [DropEntry] {
+        let backfill = DropReason.backfillEvicted.rawValue
+        var groups: [String: [Int]] = [:]
+        var order: [String] = []
+        for (i, e) in entries.enumerated() where !keep.contains(e) {
+            guard e.reason == backfill || (e.oseqFrom >= 1 && e.n == e.oseqTo - e.oseqFrom + 1) else { continue }
+            let k = "\(e.sessionId)|\(e.reason)"
+            if groups[k] == nil { order.append(k) }
+            groups[k, default: []].append(i)
+        }
+        var placed: [Int: [DropEntry]] = [:]
+        var absorbed = Set<Int>()
+        func fold(_ members: [Int], _ make: (DropEntry) -> DropEntry) {
+            guard members.count > 1 else { return }
+            var m = entries[members[0]]
+            for i in members.dropFirst() {
+                m.atMs = max(m.atMs, entries[i].atMs)
+                m.lastAckAgeMs = max(m.lastAckAgeMs, entries[i].lastAckAgeMs)
+            }
+            let at = members.min()!
+            placed[at, default: []].append(make(m))
+            absorbed.formUnion(members)
+        }
+        for k in order {
+            let idx = groups[k]!
+            if entries[idx[0]].reason == backfill {
+                let total = idx.reduce(Int64(0)) { $0 + entries[$1].n }
+                fold(idx) { var m = $0; m.n = total; return m }
+                continue
+            }
+            let sorted = idx.sorted { (entries[$0].oseqFrom, entries[$0].oseqTo) < (entries[$1].oseqFrom, entries[$1].oseqTo) }
+            var run: [Int] = []
+            var from: Int64 = 0
+            var to: Int64 = 0
+            func flush() {
+                let (f, t) = (from, to)
+                fold(run) { var m = $0; m.oseqFrom = f; m.oseqTo = t; m.n = t - f + 1; return m }
+            }
+            for i in sorted {
+                let e = entries[i]
+                if !run.isEmpty && e.oseqFrom <= to + 1 {
+                    to = max(to, e.oseqTo)
+                    run.append(i)
                 } else {
-                    acc[k] = e
-                    order.append(k)
+                    if !run.isEmpty { flush() }
+                    run = [i]
+                    from = e.oseqFrom
+                    to = e.oseqTo
                 }
             }
-            return order.map { acc[$0]! }
+            if !run.isEmpty { flush() }
         }
-        let bySession = merge(entries) { "\($0.sessionId)|\($0.reason)" }
-        if bySession.count <= limit { return bySession }
-        return merge(bySession) { $0.reason }
+        var out: [DropEntry] = []
+        for (i, e) in entries.enumerated() {
+            if let ms = placed[i] { out.append(contentsOf: ms) }
+            if !absorbed.contains(i) { out.append(e) }
+        }
+        return out
     }
 
     // MARK: 杂项

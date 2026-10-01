@@ -88,6 +88,18 @@ enum IDs {
         return uuidv5(namespace: namespace, name: "\(installId):\(sessionId):backfill:\(segNo):\(seqFrom)")
     }
 
+    /// 413 切分出的半批：`${install_id}:${session_id}:primary:${oseq_from}:${oseq_to}`（ADR 0019 决定 11；install_id 取原批信封）。
+    /// 与未切分批（name 以 oseq_from 结尾）必不同名；同一区间重切得到同名文件，可重入。
+    static func splitBatchIdName(installId: String, sessionId: String, oseqFrom: Int64, oseqTo: Int64) -> String {
+        "\(installId):\(sessionId):primary:\(oseqFrom):\(oseqTo)"
+    }
+
+    static func splitBatchId(installId: String, sessionId: String, oseqFrom: Int64, oseqTo: Int64) -> String? {
+        guard isUuid(installId), isUuid(sessionId), oseqFrom >= 1, oseqTo >= oseqFrom else { return nil }
+        return uuidv5(namespace: namespace, name: splitBatchIdName(installId: installId, sessionId: sessionId,
+                                                                   oseqFrom: oseqFrom, oseqTo: oseqTo))
+    }
+
     /// 新的随机 UUID（v4，小写）。
     static func newV4() -> String { UUID().uuidString.lowercased() }
 }

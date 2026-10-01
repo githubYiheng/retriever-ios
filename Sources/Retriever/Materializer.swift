@@ -67,13 +67,13 @@ extension Engine {
         let budget = Limits.batchUncompressedBytesClient
         let isCurrent = s === current
         // 头部字节上限估计：用最大位数的数字占位，外加 extras 的真实字节
-        func headerBytes(user: String?, extras: ([DropEntry], [ClosedSession], Int64)?, mapping: Bool) -> Int {
+        func headerBytes(user: String?, extras: ([DropEntry], [ClosedSession])?, mapping: Bool) -> Int {
             var h = EnvelopeHeader(kind: .primary, batchId: IDs.namespace, createdMs: 9_999_999_999_999, day: "2026-09-29",
                                    installId: inst.installId, sessionId: s.meta.sessionId, sessionNo: s.meta.sessionNo,
                                    process: s.meta.process, userId: user, device: s.meta.device,
                                    seqFrom: 9_007_199_254_740_991, seqTo: 9_007_199_254_740_991,
                                    oseqFrom: 9_007_199_254_740_991, oseqTo: 9_007_199_254_740_991, ctxTruncated: 9_007_199_254_740_991)
-            if let e = extras { h.drops = e.0; h.closedSessions = e.1; h.closedSessionsDropped = e.2 }
+            if let e = extras { h.drops = e.0; h.closedSessions = e.1 }
             if mapping { h.mapping = (user, s.meta.device) }
             return h.encodePrefix().count + 2
         }
@@ -175,7 +175,6 @@ extension Engine {
             if c.extras {
                 h.drops = extras.0
                 h.closedSessions = extras.1
-                h.closedSessionsDropped = extras.2
                 usedExtras = true
             }
             if c.mapping { h.mapping = (c.user, s.meta.device) }
@@ -201,39 +200,20 @@ extension Engine {
         return m.userId != user || m.deviceDigest != digest || now - m.ackedMs >= Limits.mappingRefreshMs
     }
 
-    /// 取本批要带的 drops（≤ 100，超出按 reason 合并）与 closed_sessions（≤ 20，更旧的合并为计数）。
-    /// 条目留在 jsonl 里直到携带它的批 2xx；在途的用内存集合排除，避免重复携带。
-    func takeExtras() -> ([DropEntry], [ClosedSession], Int64) {
+    /// 取本批要带的 drops（≤ 100）与 closed_sessions（≤ 20）：按文件顺序取最旧的、未在途的条目（ADR 0019 决定 2）。
+    /// 携带不改写文件、不合并、不计数；带不完的留给下一批。条目留在 jsonl 里直到携带它的批 2xx；在途的用内存集合排除。
+    func takeExtras() -> ([DropEntry], [ClosedSession]) {
         FS.withDirLock(root) {
-            var drops = readDropsLocked()
-            var avail = drops.filter { !embeddedDrops.contains($0) }
-            if avail.count > Limits.dropsPerBatch {
-                let merged = Engine.mergeDrops(avail, limit: Limits.dropsPerBatch)
-                let embedded = drops.filter { embeddedDrops.contains($0) }
-                drops = embedded + merged
-                FS.writeAtomic(dropsURL, JSONL.encodeDrops(drops))
-                avail = merged
-            }
-            let takeDrops = Array(avail.prefix(Limits.dropsPerBatch))
-            embeddedDrops.formUnion(takeDrops)
-
-            let closed = readClosedLocked()
-            var availC = closed.filter { !embeddedClosed.contains($0.sessionId) }
-            var dropped: Int64 = 0
-            if availC.count > Limits.closedSessionsPerBatch {
-                availC.sort { $0.endedMs < $1.endedMs }
-                let older = availC.prefix(availC.count - Limits.closedSessionsPerBatch)
-                dropped = Int64(older.count)
-                let olderIds = Set(older.map(\.sessionId))
-                FS.writeAtomic(sessionsURL, JSONL.encodeClosed(closed.filter { !olderIds.contains($0.sessionId) }))
-                availC = Array(availC.suffix(Limits.closedSessionsPerBatch))
-            }
-            embeddedClosed.formUnion(availC.map(\.sessionId))
-            return (takeDrops, availC, dropped)
+            let drops = Array(readDropsLocked().lazy.filter { !self.embeddedDrops.contains($0) }.prefix(Limits.dropsPerBatch))
+            embeddedDrops.formUnion(drops)
+            let closed = Array(readClosedLocked().lazy.filter { !self.embeddedClosed.contains($0.sessionId) }
+                .prefix(Limits.closedSessionsPerBatch))
+            embeddedClosed.formUnion(closed.map(\.sessionId))
+            return (drops, closed)
         }
     }
 
-    func releaseExtras(_ e: ([DropEntry], [ClosedSession], Int64)) {
+    func releaseExtras(_ e: ([DropEntry], [ClosedSession])) {
         embeddedDrops.subtract(e.0)
         embeddedClosed.subtract(e.1.map(\.sessionId))
     }
@@ -277,7 +257,8 @@ extension Engine {
             if e && !Bytes.contains(ctxMark, in: s) { err = true }
         }
         let prio = OutboxName.parse(name)?.prio ?? 1
-        return BatchMeta(name: name, prio: prio, createdMs: h.createdMs, batchId: h.batchId, kind: h.kind, sessionId: h.sessionId,
+        return BatchMeta(name: name, prio: prio, createdMs: h.createdMs, batchId: h.batchId, kind: h.kind,
+                         installId: h.installId, sessionId: h.sessionId,
                          oseqFrom: h.oseqFrom ?? 0, oseqTo: h.oseqTo ?? 0, lineCount: lines.count, hasWarnOrAbove: warn,
                          hasError: err, drops: h.drops, closed: h.closedSessions,
                          mappingUser: h.mapping.map { .some($0.userId) } ?? .none,

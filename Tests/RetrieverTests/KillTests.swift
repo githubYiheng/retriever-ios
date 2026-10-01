@@ -10,10 +10,10 @@ final class KillTests: XCTestCase {
         Bundle(for: KillTests.self).bundleURL.deletingLastPathComponent().appendingPathComponent("RetrieverKillHelper")
     }
 
-    func runHelper(root: URL, n: Int, torn: Bool) throws -> (seq: Int64, oseq: Int64) {
+    func runHelper(root: URL, n: Int, torn: Bool, fatal: Bool = false) throws -> (seq: Int64, oseq: Int64) {
         let p = Process()
         p.executableURL = KillTests.helperURL
-        p.arguments = ["--root", root.path, "--n", String(n)] + (torn ? ["--torn"] : [])
+        p.arguments = ["--root", root.path, "--n", String(n)] + (torn ? ["--torn"] : []) + (fatal ? ["--fatal"] : [])
         let out = Pipe()
         p.standardOutput = out
         try p.run()
@@ -129,6 +129,34 @@ final class KillTests: XCTestCase {
         let covered = envs.flatMap { lines(of: $0.1).compactMap { ($0["oseq"] as? NSNumber)?.int64Value } }.sorted()
         XCTAssertEqual(covered, Array(1...300) + [302])
         let results = try runValidator(envs.map(\.1))
+        for r in results { XCTAssertEqual(r["ok"] as? Bool, true, "\(r)") }
+    }
+
+    /// fatal 后立刻被杀（ADR 0020 决定 1：fatal 不再同步封段物化）：fatal 行已在 log() 返回前落盘，重启后恢复出来；
+    /// 义务行 oseq 连续、各批首尾相接，fatal 所在批的 batch_id 与正常封段时相同（UUIDv5(…:primary:<oseq_from>)，确定性）。
+    /// 后台的封段物化在被杀前完成与否，结果都一样。
+    func testFatalThenKillBeforeSeal() async throws {
+        let root = makeTempDir("rtv-fatal")
+        let (seq, oseq) = try runHelper(root: root, n: 50, torn: false, fatal: true)
+        XCTAssertEqual(seq, 51)
+        XCTAssertEqual(oseq, 6, "5 行 warn + fatal")
+        let h = Harness(root: root, key: "")
+        await h.settle()
+        let (sid, dir) = oldSession(root, current: h.client.writer.currentSessionId)
+        let ls = allLines(dir)
+        let fatalLine = try XCTUnwrap(ls.first { $0["level"] as? String == "fatal" })
+        XCTAssertEqual(fatalLine["msg"] as? String, "fatal line")
+        XCTAssertEqual(int(fatalLine["oseq"]), 6)
+        XCTAssertEqual(ls.compactMap { ($0["oseq"] as? NSNumber)?.int64Value }, Array(1...7), "fatal 之后接着合成 unclean_exit")
+        let envs = h.envelopes().filter { $0.1["session_id"] as? String == sid }.map(\.1)
+        let covered = envs.flatMap { lines(of: $0).filter { $0["ctx"] == nil }.compactMap { ($0["oseq"] as? NSNumber)?.int64Value } }.sorted()
+        XCTAssertEqual(covered, Array(1...7), "不丢不重")
+        let carrier = envs.filter { lines(of: $0).contains { $0["level"] as? String == "fatal" } }
+        XCTAssertEqual(carrier.count, 1)
+        let iid = try XCTUnwrap(h.client.installId)
+        XCTAssertEqual(int(carrier[0]["oseq_from"]), 1)
+        XCTAssertEqual(carrier[0]["batch_id"] as? String, IDs.batchId(installId: iid, sessionId: sid, kind: .primary, n: 1))
+        let results = try runValidator(envs)
         for r in results { XCTAssertEqual(r["ok"] as? Bool, true, "\(r)") }
     }
 

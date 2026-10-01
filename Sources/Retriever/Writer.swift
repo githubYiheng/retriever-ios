@@ -65,10 +65,12 @@ final class Writer: @unchecked Sendable {
     // MARK: 会话
 
     /// 开始（或重开）一个会话：seq / oseq 从 0 起，打开 seg-000001.open。
+    /// 旧会话还没交出去的封段任务一并作废（purgeLocal：它们在改名出去的旧 root 里，随旧状态删除）。
     func startSession(dir: URL, sessionId: String) {
         lock.lock()
         defer { lock.unlock() }
         if fd >= 0 { close(fd) }
+        for j in pending where j.fd >= 0 { close(j.fd) }
         fd = -1
         sessionDir = dir
         self.sessionId = sessionId
@@ -271,22 +273,23 @@ final class Writer: @unchecked Sendable {
     }
 
     /// setUser：值变化即封段；当前段还没有行时直接改写 header（用户边界 = 段边界）。
+    /// 返回 changed = 值变了（身份变化，要重拉配置），rotated = 封了段（二者不同：空段改写 header 时变了但没封）。
     @discardableResult
-    func setUser(_ u: String?) -> Bool {
+    func setUser(_ u: String?) -> (changed: Bool, rotated: Bool) {
         lock.lock()
         defer { lock.unlock() }
-        guard u != user else { return false }
+        guard u != user else { return (false, false) }
         user = u
         if fd >= 0 && cur.lineCount == 0 {
             let header = SegmentHeader(segNo: cur.segNo, userId: u, startedMs: cur.startedMs).encode()
             if ftruncate(fd, 0) == 0, header.withUnsafeBytes({ FS.writeAll(fd, $0) }) {
                 cur.userId = u
                 cur.bytes = Int64(header.count)
-                return false
+                return (true, false)
             }
         }
-        if fd < 0 { cur.userId = u; return false }
-        return rotateLocked(.user, noCtx: false)
+        if fd < 0 { cur.userId = u; return (true, false) }
+        return (true, rotateLocked(.user, noCtx: false))
     }
 
     /// 定时器：error 去抖到期 / warn 计时到期（仅当有义务行）。

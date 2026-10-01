@@ -109,6 +109,7 @@ enum LineEncoder {
     }
 
     /// attrs：键按字典序；≤ 32 键；贪心装入直到序列化 ≤ 4096 B；非有限数转 string。返回 (JSON 或 nil, 是否截断)。
+    /// 字符串值先截到预算再转义（ADR 0020 决定 3）：超过预算的值本来就装不下、照样跳过，只是不再为它整串转义（分配有上限）。
     static func encodeAttrs(_ attrs: [String: AttrValue]) -> ([UInt8]?, Bool) {
         var truncated = false
         var keys = attrs.keys.sorted()
@@ -124,7 +125,7 @@ enum LineEncoder {
             item.string(k)
             item.raw(":")
             switch attrs[k]! {
-            case .string(let s): item.string(s)
+            case .string(let s): item.string(Text.truncate(s, maxBytes: Limits.lineAttrsBytes).0)
             case .bool(let b): item.bool(b)
             case .number(let d):
                 if d.isFinite { item.number(d) } else { item.string(d.isNaN ? "NaN" : (d > 0 ? "Infinity" : "-Infinity")) }

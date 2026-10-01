@@ -131,6 +131,129 @@ final class ConfigTests: XCTestCase {
         await h.settle()
     }
 
+    /// setUser 值变化 → 立即按新身份拉配置；有在途请求时不并发，在途结束后再拉一次；同值不拉（ADR 0019 决定 12）。
+    /// 修复前：setUser 不拉配置，启动那次在途请求还会吞掉新请求。
+    func testSetUserRefetchesConfigAfterInFlight() async throws {
+        let t = FakeTransport()
+        t.configHang = true
+        let h = Harness(transport: t)
+        await waitFor { t.hangingCount == 1 }
+        XCTAssertEqual(t.configRequests.count, 1)
+        XCTAssertNil(t.configRequests[0].headers["X-Rtv-User"])
+        h.client.setUser("U")
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertEqual(t.configRequests.count, 1, "在途时不并发")
+        t.configHang = false
+        t.cancelAll()                                   // 放行启动那次
+        await h.settle()
+        XCTAssertEqual(t.configRequests.count, 2)
+        XCTAssertEqual(t.configRequests.last?.headers["X-Rtv-User"], "U")
+        h.client.setUser("U")
+        await h.settle()
+        XCTAssertEqual(t.configRequests.count, 2, "同值不重拉")
+        h.client.setUser("V")
+        await h.settle()
+        XCTAssertEqual(t.configRequests.count, 3, "空段改写 header（不封段）也算身份变化")
+        XCTAssertEqual(t.configRequests.last?.headers["X-Rtv-User"], "V")
+    }
+
+    /// 配置属于请求时的身份：A 的响应在切到 B 之后才到 → 丢弃（不缓存、不生效）并按 B 重拉；A 的 full_dump 从未作用于 B。
+    func testStaleIdentityResponseDiscarded() async throws {
+        let t = FakeTransport()
+        let h = Harness(transport: t)
+        await h.settle()
+        h.client.setUser("A")
+        await h.settle()
+        t.configBody = ["etag": "a", "full_dump": true, "full_dump_ttl_s": 3600]
+        t.configHold = true
+        h.client.fetchConfig()
+        await waitFor { t.heldConfigCount == 1 }
+        XCTAssertEqual(t.configRequests.last?.headers["X-Rtv-User"], "A")
+        h.client.setUser("B")
+        t.configBody = ["etag": "b"]
+        t.configHold = false
+        t.releaseHeldConfigs()                          // A 的响应（full_dump）此刻才到
+        await h.settle()
+        let eff = await h.work { $0.effective }
+        XCTAssertFalse(eff.fullDumpActive, "A 的覆盖不作用于 B")
+        XCTAssertEqual(eff.config.etag, "b", "按 B 重拉的响应生效")
+        XCTAssertEqual(t.configRequests.last?.headers["X-Rtv-User"], "B")
+        XCTAssertEqual(h.outboxFiles("p2"), [], "full_dump 从未生效（没有 backfill）")
+        XCTAssertEqual(h.json("config.json")?["config"].flatMap { ($0 as? [String: Any])?["etag"] as? String }, "b", "旧身份的响应没被缓存")
+    }
+
+    /// 身份变化的那一刻缓存按过期处理：上一个用户的放大型覆盖（full_dump、低上传级别）立即回落，不等新配置回来。
+    func testSetUserExpiresAmplifyingConfig() async throws {
+        let t = FakeTransport()
+        t.configBody = ["etag": "fd", "ttl_s": 1800, "full_dump": true, "full_dump_ttl_s": 3600, "upload_level": "debug"]
+        let h = Harness(transport: t)
+        await h.settle()
+        h.client.setUser("A")
+        await h.settle()
+        let before = await h.work { $0.effective }
+        XCTAssertTrue(before.fullDumpActive)
+        XCTAssertEqual(h.client.effectiveLevels.upload, .debug)
+        t.configHang = true
+        h.client.setUser("B")
+        let after = await h.work { $0.effective }
+        XCTAssertFalse(after.fullDumpActive, "身份一变，放大型字段立即回落")
+        XCTAssertEqual(after.uploadLevel, .warn)
+        XCTAssertEqual(h.client.effectiveLevels.upload, .warn)
+        t.configHang = false
+        t.cancelAll()
+        await h.settle()
+    }
+
+    /// 身份变化只回落放大上传的字段、不动 local_cap（ADR 0019 决定 12）：远程 local_cap_bytes = 宿主默认 × 2、出站箱义务批
+    /// 超过宿主默认时，setUser 不驱逐、不记 buffer_overflow；身份过期标志只在内存，config.json 不变。真正的 TTL 过期照旧回落并驱逐（宪法 U-2）。
+    /// 修复前：身份过期借道「把拉取时刻往前推一个 TTL」，local_cap 跟着回落，换个用户就删掉还没上传的义务批。
+    func testSetUserDoesNotEvictOnCapFallback() async throws {
+        let hostCap = Limits.localCapBytesMin
+        let t = FakeTransport()
+        t.configBody = ["etag": "big", "ttl_s": 1800, "local_cap_bytes": 2 * hostCap, "upload_enabled": false]
+        var o = Options()
+        o.localCapBytes = hostCap
+        let h = Harness(options: o, transport: t)
+        await h.settle()
+        let eff0 = await h.work { $0.effective }
+        XCTAssertEqual(eff0.config.localCapBytes, 2 * hostCap)
+        // 不可压缩的 warn 行（义务行，upload_enabled = false 只落盘）：出站箱批总量超过宿主默认
+        func boxBytes() -> Int { h.outboxFiles().reduce(0) { $0 + Int(FS.size(h.outbox.appendingPathComponent($1)) ?? 0) } }
+        var n = 0
+        repeat {
+            for _ in 0..<50 {
+                var r = [UInt8](repeating: 0, count: 2250)
+                arc4random_buf(&r, r.count)
+                h.client.log(.warn, Data(r).base64EncodedString())
+            }
+            n += 50
+            await h.settle()
+        } while boxBytes() < hostCap + hostCap / 8 && n < 4000
+        await h.seal()
+        XCTAssertGreaterThan(boxBytes(), hostCap)
+        XCTAssertEqual(h.readJSONL("drops.jsonl").count, 0, "远程上限内：义务批全在")
+        let before = h.outboxFiles()
+        let cfgFile = try Data(contentsOf: h.root.appendingPathComponent("config.json"))
+        t.configHang = true                                 // 新身份的配置迟迟不回：缓存停在「身份过期」
+        h.client.setUser("b")
+        let eff1 = await h.work { $0.effective }
+        XCTAssertTrue(eff1.expired, "身份一变按过期处理")
+        XCTAssertEqual(eff1.config.localCapBytes, 2 * hostCap, "local_cap 不随身份回落")
+        XCTAssertEqual(h.outboxFiles(), before, "没有批被删")
+        XCTAssertFalse(h.readJSONL("drops.jsonl").contains { $0["reason"] as? String == "buffer_overflow" })
+        XCTAssertEqual(try Data(contentsOf: h.root.appendingPathComponent("config.json")), cfgFile, "身份过期不落盘")
+        // 真正的 TTL 过期：local_cap 回落宿主默认，超出的义务批照旧按 buffer_overflow 驱逐
+        t.configBody = nil                                  // 此后的拉取 404，缓存不被刷新
+        t.configHang = false
+        t.cancelAll()
+        await h.settle()
+        await h.tick(advance: 1800 * 1000)
+        let eff2 = await h.work { $0.effective }
+        XCTAssertEqual(eff2.config.localCapBytes, hostCap)
+        XCTAssertTrue(h.readJSONL("drops.jsonl").contains { $0["reason"] as? String == "buffer_overflow" })
+        XCTAssertLessThan(h.outboxFiles().count, before.count)
+    }
+
     /// 不看网络类型（ADR 0009）：backfill 批与其它批走同一套队列 / 退避规则，生成后照常上传。
     func testBackfillUploadsLikeOtherBatches() async throws {
         let t = FakeTransport()

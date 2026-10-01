@@ -25,12 +25,15 @@ struct InstallInfo: Equatable {
 }
 
 /// meta.json：会话开始时原子写。
+/// `install_id`（可选键，ADR 0019 决定 6）：bootstrap 时的 install 身份冗余副本，install.json 损坏时据此修复；
+/// 0.1.x 写的 meta 没有这个键（照读，只是不当副本），旧 SDK 读新文件忽略它。
 struct SessionMeta: Equatable {
     var sessionId: String
     var sessionNo: Int64
     var startedMs: Int64
     var device: Device
     var process: String
+    var installId: String?
 
     func encode() -> [UInt8] {
         var o = JSONOut()
@@ -39,6 +42,7 @@ struct SessionMeta: Equatable {
         o.raw(",\"started_ms\":"); o.int(startedMs)
         o.raw(",\"device\":"); device.encode(into: &o)
         o.raw(",\"process\":"); o.string(process)
+        if let i = installId { o.raw(",\"install_id\":"); o.string(i) }
         o.raw("}")
         return o.bytes
     }
@@ -48,7 +52,8 @@ struct SessionMeta: Equatable {
               let no = JSONIn.int64(o["session_no"]), no >= 1,
               let dev = Device.decode(o["device"]) else { return nil }
         return SessionMeta(sessionId: sid, sessionNo: no, startedMs: JSONIn.int64(o["started_ms"]) ?? 0,
-                           device: dev, process: (o["process"] as? String) ?? "main")
+                           device: dev, process: (o["process"] as? String) ?? "main",
+                           installId: (o["install_id"] as? String).flatMap { IDs.isUuid($0) ? $0 : nil })
     }
 }
 
@@ -266,6 +271,7 @@ struct EnvelopeHeader {
     var ctxTruncated: Int64?
     var drops: [DropEntry] = []
     var closedSessions: [ClosedSession] = []
+    /// 本版不再产生（终态带不完留给下一批，ADR 0019 决定 2）；只为 413 切分 0.1.x 留在出站箱的旧批时原样转交。
     var closedSessionsDropped: Int64 = 0
     var mapping: (userId: String?, device: Device)? = nil
 
@@ -351,6 +357,8 @@ struct BatchMeta {
     var createdMs: Int64
     var batchId: String
     var kind: IDs.BatchKind
+    /// 信封里的 install_id：请求头 `X-Rtv-Install` 用它（ADR 0019 决定 10）；读不出信封的兜底元数据为空 = 用当前值。
+    var installId: String
     var sessionId: String
     var oseqFrom: Int64
     var oseqTo: Int64

@@ -85,7 +85,9 @@ final class SegmentTests: XCTestCase {
         let before = h.transport.batchRequests.count
         h.client.log(.info, "ctx before fatal")
         h.client.log(.fatal, "crashing")
-        // log() 返回时批已在出站箱（同步物化），且没有发起上传
+        // log() 返回时已换段；封段与物化投递到后台（不等待，ADR 0020），完成后批在出站箱，且没有发起上传
+        XCTAssertEqual(h.client.writer.snapshot.segNo, 2)
+        await h.settle()
         XCTAssertEqual(h.outboxFiles("p0").count, 1)
         XCTAssertEqual(h.transport.batchRequests.count, before)
         let e = try XCTUnwrap(h.envelopes("p0").first?.1)

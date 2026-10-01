@@ -131,6 +131,7 @@ final class EnvelopeCrossLangTests: XCTestCase {
             await h.settle()
             h.client.log(.info, "last words")
             h.client.log(.fatal, "fatal", error: NSError(domain: "D", code: 1))
+            await h.settle()   // fatal 的封段物化在后台（ADR 0020）
             cases.append(expect("fatal", try XCTUnwrap(h.envelopes("p0").first?.1)))
         }
 

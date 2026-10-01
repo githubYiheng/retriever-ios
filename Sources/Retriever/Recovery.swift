@@ -4,8 +4,8 @@ import Darwin
 #endif
 
 /// 启动恢复（§3.4 ORPHAN）：旧会话截残行、判退出、unclean_fg 合成 error 并按 error 封段带 ctx、
-/// 旧会话终态写 sessions.jsonl；旧 session_id / user_id / device 一律取持久化值；
-/// cursor = max(cursor 文件, 出站箱里本会话最大 oseq_to)。
+/// 有义务行的旧会话终态写 sessions.jsonl；旧 session_id / user_id / device 一律取持久化值；
+/// cursor = max(cursor 文件, 出站箱里本会话最大 oseq_to)。段读不出的会话原样留到下次启动；零行的会话目录直接删。
 extension Engine {
     static let uncleanTag = Array("\"tag\":\"rtv.unclean_exit\"".utf8)
 
@@ -59,7 +59,8 @@ extension Engine {
         var files: [SegmentFile] = []
         for (_, isOpen, n) in segNames {
             let url = dir.appendingPathComponent(n)
-            guard var f = Segments.read(url, validate: isOpen) else { continue }
+            // 段读不出（保护类 / fd 耗尽等）：不推进 cursor、不删会话目录、不写终态，整个会话留到下次启动重试（ADR 0019 决定 13）
+            guard var f = Segments.read(url, validate: isOpen) else { return meta }
             if isOpen && f.validEnd < f.data.count {
                 // 截残行：回到最后一个完整行
                 let fd = open(url.path, O_WRONLY | O_CLOEXEC)
@@ -92,6 +93,16 @@ extension Engine {
         maxOseq = max(maxOseq, cursor.extractedThroughOseq, tombMax)
         maxSeq = max(maxSeq, cursor.ctxThroughSeq)
 
+        if maxSeq == 0 && maxOseq == 0 {
+            // 零行：盘上无行，也没有任何已物化 / 已驱逐 / 墓碑的痕迹（后台拉起的空进程、禁用期间的进程多是这样）：
+            // 无数据、无终态可写，目录直接删（ADR 0019 决定 1），不留到 7 天年龄驱逐、也不在每次冷启动重读。
+            // 判零行在合成 rtv.unclean_exit 之前：禁用期间启动的会话必是零行，不能事后由已启用的进程替它合成一条
+            // 带时刻的崩溃证据上报（撤回同意 = 不写不传，ADR 0020 决定 2）；代价是启用期「一行未写就前台崩溃」不留痕
+            FS.remove(dir)
+            return meta
+        }
+
+        var exit: SessionExit = .unknown
         if cursor.closedMs == nil {
             // 缺口（残行、全 0 块、未落盘的 write_failed）计 corrupt 墓碑；已有墓碑覆盖的不重复记
             let covered = existingDrops.filter { $0.sessionId == sid }
@@ -105,10 +116,11 @@ extension Engine {
                                           reason: DropReason.corrupt.rawValue, atMs: now, lastAckAgeMs: lastAckAge(now)))
                 o += 1
             }
-            let exit: SessionExit = cursor.lastState == "fg" ? .uncleanFg : (cursor.lastState == "bg" ? .cleanBg : .unknown)
+            exit = cursor.lastState == "fg" ? .uncleanFg : (cursor.lastState == "bg" ? .cleanBg : .unknown)
             let lastRaw: ArraySlice<UInt8>? = files.last.flatMap { f in f.lines.last.map { f.data[$0.range] } }
             let alreadySynth = lastRaw.map { Bytes.contains(Engine.uncleanTag, in: $0) } ?? false
-            if exit == .uncleanFg && !alreadySynth {
+            // 合成行也是写入：只看本进程内存开关（禁用 = 不写，ADR 0020 决定 2）
+            if exit == .uncleanFg && !alreadySynth && enabled {
                 let oblig = LogLevel.error.rank >= effective.uploadLevel.rank
                 let seq = maxSeq + 1
                 let oseq: Int64 = oblig ? maxOseq + 1 : 0
@@ -136,22 +148,30 @@ extension Engine {
                     }
                 }
             }
+        }
+
+
+        if cursor.closedMs == nil {
             let sealed = sealAll(files)
             let rec = SessionRecord(meta: meta, dir: dir, cursor: cursor, sealed: sealed)
-            if !existingClosed.contains(sid) {
-                let c = ClosedSession(sessionId: sid, sessionNo: meta.sessionNo, startedMs: meta.startedMs,
-                                      endedMs: max(maxTs, cursor.lastStateMs, meta.startedMs), lastSeq: maxSeq,
-                                      lastOseq: maxOseq, exit: exit.rawValue)
-                FS.withDirLock(root) { _ = FS.append(sessionsURL, JSONL.encodeClosed([c])) }
+            // 终态只为有义务行的会话写（ADR 0019 决定 1）：没有义务行的会话服务端无可结算，空会话的终态只会挤占别人
+            var closedOk = true
+            if maxOseq > 0 && !existingClosed.contains(sid) {
+                closedOk = appendClosed(ClosedSession(sessionId: sid, sessionNo: meta.sessionNo, startedMs: meta.startedMs,
+                                                      endedMs: max(maxTs, cursor.lastStateMs, meta.startedMs), lastSeq: maxSeq,
+                                                      lastOseq: maxOseq, exit: exit.rawValue))
             }
-            if !newTombs.isEmpty {
-                appendDrops(newTombs)
-                newTombs.removeAll()
+            let dropsOk = newTombs.isEmpty ? true : appendDrops(newTombs)
+            // 按 error 封段带 ctx（合成 error 在批内 → 自动附 ctx）。墓碑没写成就不物化：游标一旦越过缺口，
+            // 下次启动的缺口扫描（从游标往后）再也找不到它；整个会话留到下次启动重试（同段读不出，ADR 0019 决定 13）
+            if dropsOk {
+                materialize(rec, targetOseq: maxOseq, targetSeq: maxSeq, noCtx: false, ignoreCap: true)
             }
-            // 按 error 封段带 ctx（合成 error 在批内 → 自动附 ctx）
-            materialize(rec, targetOseq: maxOseq, targetSeq: maxSeq, noCtx: false, ignoreCap: true)
-            rec.cursor.closedMs = now
-            writeCursor(rec)
+            // 终态或墓碑没写成（磁盘满等）：不打「已收尾」标记，下次启动重试（终态按 session_id、合成行都有防重复），不静默丢
+            if closedOk && dropsOk {
+                rec.cursor.closedMs = now
+                writeCursor(rec)
+            }
             register(rec)
         } else {
             let rec = SessionRecord(meta: meta, dir: dir, cursor: cursor, sealed: sealAll(files))

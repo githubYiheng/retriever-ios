@@ -101,6 +101,31 @@ final class TruncationTests: XCTestCase {
         XCTAssertLessThanOrEqual(try JSONSerialization.data(withJSONObject: a3).count, 4096)
     }
 
+    /// attrs 的值先截到预算再转义（ADR 0020 决定 3）：16 MB 的值不再整串转义（修复前约 0.5 s、数十 MB 分配）；
+    /// 结果不变——装不下的键照样跳过并打 truncated，装得下的逐字节不变。
+    func testHugeAttrValueBounded() throws {
+        let huge = String(repeating: "\"", count: 16 * 1024 * 1024)
+        let t0 = nowNs()
+        let e = LineEncoder.encode(LogLine(ts: 1, level: .info, msg: "x", attrs: ["big": .string(huge), "ok": .bool(true)]))
+        XCTAssertLessThan(elapsedMs(since: t0), 100, "只转义预算内的前缀")
+        let (o, _) = try decode(e)
+        XCTAssertEqual(o["attrs"] as? [String: Bool], ["ok": true])
+        XCTAssertEqual(o["truncated"] as? Bool, true)
+        let fits = String(repeating: "\"", count: 2000)
+        let (j, t) = LineEncoder.encodeAttrs(["s": .string(fits)])
+        XCTAssertFalse(t)
+        XCTAssertEqual(j.map { String(decoding: $0, as: UTF8.self) }, "{\"s\":\"" + String(repeating: "\\\"", count: 2000) + "\"}")
+    }
+
+    /// `AttrValue.int`：安全范围内是 number（与 `.number(Double)` 逐字节相同），超出是十进制字符串；不新增 enum case。
+    func testIntFactory() {
+        XCTAssertEqual(AttrValue.int(42), .number(42))
+        XCTAssertEqual(AttrValue.int(-9_007_199_254_740_991), .number(-9_007_199_254_740_991))
+        XCTAssertEqual(AttrValue.int(9_007_199_254_740_992), .string("9007199254740992"))
+        XCTAssertEqual(AttrValue.int(Int64.min), .string("-9223372036854775808"))
+        XCTAssertEqual(AttrValue.int(Int64.max), .string("9223372036854775807"))
+    }
+
     func testSerializedLineCapped16KB() throws {
         // attrs 4 KB + stack 16 KB（控制字符，转义 6 倍）+ msg 4 KB ASCII → 先删 attrs、再截 stack，msg 保住
         var attrs: [String: AttrValue] = [:]

@@ -46,8 +46,9 @@ final class BackupAndPerfTests: XCTestCase {
         await h2.settle()
         XCTAssertEqual(h2.client.installId, h.client.installId)
         XCTAssertTrue(h2.client.supportCode!.hasSuffix("-2"))
-        // purgeLocal：新 install_id
-        h2.client.purgeLocal()
+        // purgeLocal：新 install_id（不阻塞调用线程，完成回调里才是新值，ADR 0020）
+        let purged = await purgeAndWait(h2.client)
+        XCTAssertEqual(purged, h2.client.installId)
         XCTAssertNotEqual(h2.client.installId, h.client.installId)
         XCTAssertTrue(h2.client.supportCode!.hasSuffix("-1"))
         h2.client.log(.warn, "after purge")

@@ -64,7 +64,7 @@ extension Engine {
                 } else if let p = OutboxName.parse(name) {
                     // 读不出（位腐烂等）：保守当作含 warn 的 primary，交给服务端隔离
                     metas[name] = BatchMeta(name: name, prio: p.prio, createdMs: p.createdMs, batchId: p.batchId, kind: .primary,
-                                            sessionId: "", oseqFrom: 0, oseqTo: 0, lineCount: 0, hasWarnOrAbove: true,
+                                            installId: "", sessionId: "", oseqFrom: 0, oseqTo: 0, lineCount: 0, hasWarnOrAbove: true,
                                             hasError: p.prio == 0, drops: [], closed: [], mappingUser: .none, mappingDigest: nil,
                                             bytes: FS.size(outboxDir.appendingPathComponent(name)) ?? 0)
                 }
@@ -94,10 +94,12 @@ extension Engine {
         let today = Day.fromMs(nowWall)
         todayDay = today
         todayCount = 0
+        let iid = install?.installId
         for m in metas.values {
             embeddedDrops.formUnion(m.drops)
             embeddedClosed.formUnion(m.closed.map(\.sessionId))
-            if let u = m.mappingUser, let d = m.mappingDigest { pendingMapping = (u, d) }
+            // 别的 install 的批（多进程清空的窗口里写进来的）带的映射不算本 install 的在途映射
+            if let u = m.mappingUser, let d = m.mappingDigest, m.installId == iid { pendingMapping = (u, d) }
             if m.prio <= 1 && Day.fromMs(m.createdMs) == today { todayCount += 1 }
         }
     }
@@ -151,13 +153,18 @@ extension Engine {
         return best
     }
 
-    // MARK: 413：按 oseq（或 ctx）二分重物化（新的确定性 batch_id），原批删除
+    // MARK: 413：按 oseq（或 ctx）二分重物化（新的确定性 batch_id），全部半批提交后才删原批（ADR 0019 决定 11）
 
-    func split413(_ name: String) {
+    /// 半批 batch_id = UUIDv5(ns, `<install>:<session>:primary:<oseq_from>:<oseq_to>`)（install 取原批信封），`created_ms` 沿用原批：
+    /// 必与原批不同名（先写新、后删旧），同一区间重切得到同名同字节文件（可重入）。任一半写失败 → 删掉本次已写的半批，
+    /// 原批原样保留、返回 false（调用方按普通失败退避，下次再发再 413 再切）。「单个义务行 + 上下文折半」只产出一个文件，
+    /// 再次折半时与上一次同名、原子覆盖。切不了的（读不出 / 非 primary / 身份不合规）交给服务端隔离，返回 true。
+    @discardableResult
+    func split413(_ name: String) -> Bool {
         let url = outboxDir.appendingPathComponent(name)
         guard let gz = FS.read(url), let p = Engine.parseBatch(gz), p.header.kind == .primary else {
             quarantine(name)
-            return
+            return true
         }
         struct L { var raw: [UInt8]; var seq: Int64; var oseq: Int64; var ts: Int64; var rank: Int; var ctx: Bool }
         var ls: [L] = []
@@ -192,29 +199,46 @@ extension Engine {
             parts = [(ha, oblig + ctx)]
         } else {
             quarantine(name)
-            return
+            return true
         }
-        let old = metas[name]
         var written: [String] = []
         for part in parts {
             var hh = part.0
             var lines = part.1
             lines.sort { $0.seq < $1.seq }
-            guard let inst = install, let bid = IDs.batchId(installId: inst.installId, sessionId: hh.sessionId, kind: .primary, n: hh.oseqFrom!) else { continue }
+            guard let bid = IDs.splitBatchId(installId: h.installId, sessionId: hh.sessionId,
+                                             oseqFrom: hh.oseqFrom!, oseqTo: hh.oseqTo!) else {
+                // 信封身份不合规（推导不出确定性 id）：切不了，交给服务端隔离
+                rollback(written, keeping: name)
+                quarantine(name)
+                return true
+            }
             hh.batchId = bid
             hh.seqFrom = lines.first!.seq
             hh.seqTo = lines.last!.seq
             hh.day = Day.clientDay(tsMinMs: lines.map(\.ts).min()!, createdMs: hh.createdMs)
             let hasErr = lines.contains { !$0.ctx && $0.rank >= LogLevel.error.rank }
-            if let m = writeBatch(hh, lines: lines.map(\.raw), prio: hasErr ? 0 : 1) { written.append(m.name) }
+            guard let m = writeBatch(hh, lines: lines.map(\.raw), prio: hasErr ? 0 : 1) else {
+                rollback(written, keeping: name)
+                return false
+            }
+            written.append(m.name)
         }
-        guard written.count == parts.count else { return }
+        // 全部半批已提交，才删原批（单义务行再次折半时新文件与原批同名、已原子覆盖，不删）
         if !written.contains(name) {
             FS.remove(url)
             metas.removeValue(forKey: name)
         }
         fails.removeValue(forKey: name)
-        _ = old
+        return true
+    }
+
+    /// 413 切分没有全部写成：删掉本次已写的半批，原批原样保留。
+    private func rollback(_ written: [String], keeping original: String) {
+        for n in written where n != original {
+            FS.remove(outboxDir.appendingPathComponent(n))
+            metas.removeValue(forKey: n)
+        }
     }
 
     // MARK: 驱逐（§3.8，宪法 R-5）

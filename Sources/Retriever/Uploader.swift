@@ -20,7 +20,7 @@ extension Engine {
     func nextSend() -> SendStep {
         let nowMono = clock.monoMs()
         if key.isEmpty { return .stop(reason: "not_configured", wakeMono: nil) }
-        if !enabled { return .stop(reason: "disabled", wakeMono: nil) }
+        if !uploadAllowed() { return .stop(reason: "disabled", wakeMono: nil) }
         // 未 bootstrap（install.json 读改写失败）：不碰磁盘，等 retryBootstrap
         guard let inst = install else { return .stop(reason: "not_bootstrapped", wakeMono: nil) }
         if !effective.config.uploadEnabled { return .stop(reason: "upload_disabled", wakeMono: nil) }
@@ -52,11 +52,12 @@ extension Engine {
         for pick in eligible {
             // 读不出（fd 耗尽、保护类异常等）：跳过，不删、不隔离、不计 fail；留在出站箱下一轮再试，最终由容量驱逐兜底
             guard let body = FS.read(outboxDir.appendingPathComponent(pick.name)) else { continue }
+            // 请求头取批自身信封里的 install_id（ADR 0019 决定 10）：多进程 purge 窗口里别的进程写进来的批按自己的归属上报
             let req = HTTPRequest(method: "POST", url: baseURL.appendingPathComponent("v1/batches"), headers: [
                 "Authorization": "Bearer \(key)",
                 "Content-Type": "application/json",
                 "Content-Encoding": "gzip",
-                "X-Rtv-Install": inst.installId,
+                "X-Rtv-Install": pick.installId.isEmpty ? inst.installId : pick.installId,
                 "X-Rtv-Sent-Ms": String(clock.wallMs()),
                 "X-Rtv-Sdk": sdkHeader,
             ], body: Data(body))
@@ -104,7 +105,7 @@ extension Engine {
         case 200..<300:
             // 回显的 batch_id 与本批一致才算确认（防 captive portal）；stored 与 quarantined 都算
             if let b = body, (b["batch_id"] as? String) == meta.batchId {
-                ack(meta)
+                ack(meta, stored: (b["status"] as? String) == "stored")
                 eff.acked = true
                 if let e = b["config_etag"] as? String, e != (configCache?.config.etag ?? "") { eff.fetchConfig = true }
             } else {
@@ -119,7 +120,8 @@ extension Engine {
                 failure(name, retryAfterS: nil, reason: "http_\(r.status)", countFail: true)
             }
         case 413:
-            split413(name)
+            // 切分写不出（磁盘满等）：原批保留，按普通失败退避（不计毒批，批本身没错），免得每 2 s 重发一次再 413
+            if !split413(name) { failure(name, retryAfterS: nil, reason: "http_413", countFail: false) }
         case 429:
             categoryPause(body: body, header: r.headers["retry-after"])
         case 503:
@@ -152,7 +154,7 @@ extension Engine {
         return jitter(base)
     }
 
-    private func ack(_ meta: BatchMeta) {
+    private func ack(_ meta: BatchMeta, stored: Bool) {
         let nowWall = clock.wallMs()
         FS.remove(outboxDir.appendingPathComponent(meta.name))
         metas.removeValue(forKey: meta.name)
@@ -180,9 +182,13 @@ extension Engine {
             embeddedClosed.subtract(meta.closed.map(\.sessionId))
         }
         if let u = meta.mappingUser, let d = meta.mappingDigest {
-            let m = MappingState(userId: u, deviceDigest: d, ackedMs: nowWall)
-            mapping = m
-            FS.writeAtomic(mappingURL, m.encode())
+            // 服务端只在 stored 时写 D1 映射：隔离回的 200 不算映射已确认；别的 install 的批也不算（ADR 0019 决定 10）。
+            // 在途标记照样清掉，下一批重新带映射
+            if stored && meta.installId == install?.installId {
+                let m = MappingState(userId: u, deviceDigest: d, ackedMs: nowWall)
+                mapping = m
+                FS.writeAtomic(mappingURL, m.encode())
+            }
             if let p = pendingMapping, p.user == u, p.digest == d { pendingMapping = nil }
         }
         backoff.attempt = 0
@@ -256,8 +262,9 @@ extension Engine {
 
     // MARK: 远程配置（§5）
 
-    func configRequest() -> HTTPRequest? {
-        guard !key.isEmpty, let inst = install else { return nil }
+    /// 配置请求与它所属的身份；未配置 key、未 bootstrap、禁用（内存开关或盘上标记）时不拉（ADR 0020 决定 2）。
+    func configRequest() -> (request: HTTPRequest, identity: ConfigIdentity)? {
+        guard !key.isEmpty, uploadAllowed(), let inst = install else { return nil }
         var h: [String: String] = [
             "Authorization": "Bearer \(key)",
             "X-Rtv-Install": inst.installId,
@@ -268,20 +275,37 @@ extension Engine {
             "X-Rtv-Daily-Batch-Cap": String(host.dailyBatchCap ?? 0),
             "X-Rtv-Local-Cap-Bytes": String(host.localCapBytes),
         ]
-        if let u = writer.currentUser {
+        let user = writer.currentUser
+        if let u = user {
             // 值一律 percent-encode（ASCII 字母数字以外全部编码，服务端 decodeURIComponent）
             h["X-Rtv-User"] = u.addingPercentEncoding(withAllowedCharacters: Engine.asciiAlnum) ?? ""
         }
         // 发起即记尝试时刻（响应回来再记一次）：在途期间轮询候选不会停在过去，调度器不空转
         lastConfigFetchMono = clock.monoMs()
-        return HTTPRequest(method: "GET", url: baseURL.appendingPathComponent("v1/config"), headers: h, body: nil)
+        return (HTTPRequest(method: "GET", url: baseURL.appendingPathComponent("v1/config"), headers: h, body: nil),
+                ConfigIdentity(installId: inst.installId, userId: user))
     }
 
     static let asciiAlnum = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
 
+    /// 当前身份 (install_id, user_id)；未 bootstrap 为 nil。
+    var configIdentity: ConfigIdentity? {
+        install.map { ConfigIdentity(installId: $0.installId, userId: writer.currentUser) }
+    }
+
+    /// 身份变了（setUser 值变化）：缓存从此刻起按过期处理，放大型字段立即回落保守默认（ADR 0019 决定 12）；
+    /// 不动拉取时刻（local_cap 只随真正的 TTL 过期回落）。
+    func expireConfigForNewIdentity() {
+        guard configCache != nil else { return }
+        configCache?.identityStale = true
+        applyEffective()
+    }
+
     /// 拉到配置：钳制后缓存并生效；拉不到 / 非 200 / 非对象 → 用缓存（不放大）。
-    func applyConfigResponse(_ r: HTTPResponse?) -> ConfigEffect {
+    /// 配置属于请求时的身份：请求发出后身份变了（setUser / purge）的响应丢弃，`stale` 让调用方按新身份重拉（ADR 0019 决定 12）。
+    func applyConfigResponse(_ r: HTTPResponse?, requestedFor identity: ConfigIdentity) -> ConfigEffect {
         lastConfigFetchMono = clock.monoMs()
+        guard configIdentity == identity else { return ConfigEffect(stale: true) }
         guard let r, r.status == 200, let o = JSONIn.object(r.body) else { return ConfigEffect() }
         let cfg = ConfigRules.clamp(o, host: host)
         let nowWall = clock.wallMs()
@@ -297,6 +321,8 @@ extension Engine {
     struct ConfigEffect {
         var sealed = false
         var backfill = false
+        /// 响应属于旧身份、已丢弃：按当前身份重拉。
+        var stale = false
     }
 
     /// 重新计算生效配置并推给写入侧；full_dump 生效 / upload_enabled 变化触发封段，full_dump 生效生成 backfill。

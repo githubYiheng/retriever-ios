@@ -3,13 +3,26 @@
 <plist version="1.0">
 <dict>
 	<!-- Retriever iOS SDK 隐私清单（2026-09-30 对照 Apple「Describing use of required reason API」核实）。
-	     不做跟踪；收集的数据 = 宿主写入的日志（含宿主给的 user_id）与设备型号 / 系统版本，用于宿主自己的排障（App Functionality）。 -->
+	     不做跟踪；收集的数据 = 宿主写入的日志（含宿主给的 user_id）、设备型号 / 系统版本与 install_id，用于宿主自己的排障（App Functionality）。
+	     Device ID（ADR 0020 决定 7）：install_id 是随 app 数据容器的随机 ID，Apple 的定义含「other device-level ID」，保守申报。 -->
 	<key>NSPrivacyTracking</key>
 	<false/>
 	<key>NSPrivacyTrackingDomains</key>
 	<array/>
 	<key>NSPrivacyCollectedDataTypes</key>
 	<array>
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeDeviceID</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<true/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
 		<dict>
 			<key>NSPrivacyCollectedDataType</key>
 			<string>NSPrivacyCollectedDataTypeUserID</string>

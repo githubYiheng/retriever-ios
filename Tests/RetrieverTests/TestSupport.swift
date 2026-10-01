@@ -73,6 +73,7 @@ final class FakeTransport: Transport, @unchecked Sendable {
         case raw(Int, Data, [String: String])       // 任意响应体（HTML 等）
         case network                                // 网络错误
         case hang                                   // 挂起直到 cancelAll
+        case heldConfig                             // 配置请求挂起直到 releaseHeldConfigs（按请求时刻的 configBody 回 200）
     }
 
     private let lock = NSLock()
@@ -84,9 +85,12 @@ final class FakeTransport: Transport, @unchecked Sendable {
     var configEtag = "etag-0"
     /// 配置请求挂起直到 cancelAll（拉配置在途）。
     var configHang = false
+    /// 配置请求挂起直到 releaseHeldConfigs()，届时按请求时刻的 configBody 回 200（身份切换竞态）。
+    var configHold = false
     private(set) var requests: [HTTPRequest] = []
     private(set) var cancelCount = 0
     private var hanging: [CheckedContinuation<HTTPResponse?, Never>] = []
+    private var held: [(CheckedContinuation<HTTPResponse?, Never>, [String: Any]?)] = []
 
     func setScript(_ s: [Reply]) { lock.lock(); script = s; lock.unlock() }
 
@@ -101,11 +105,25 @@ final class FakeTransport: Transport, @unchecked Sendable {
     }
 
     var hangingCount: Int { lock.lock(); defer { lock.unlock() }; return hanging.count }
+    var heldConfigCount: Int { lock.lock(); defer { lock.unlock() }; return held.count }
+
+    /// 放行 configHold 挂住的配置请求：各自回请求时刻的 configBody。
+    func releaseHeldConfigs() {
+        lock.lock()
+        let h = held
+        held = []
+        lock.unlock()
+        for (c, cfg) in h {
+            c.resume(returning: cfg.map { HTTPResponse(status: 200, body: json($0)) } ?? HTTPResponse(status: 404))
+        }
+    }
 
     private func decide(_ request: HTTPRequest) -> (Reply?, [String: Any]?, String, String?) {
         lock.withLock {
             requests.append(request)
-            if request.url.path.hasSuffix("/v1/config") { return (configHang ? .hang : nil, configBody, configEtag, nil) }
+            if request.url.path.hasSuffix("/v1/config") {
+                return (configHold ? .heldConfig : (configHang ? .hang : nil), configBody, configEtag, nil)
+            }
             let bid = FakeTransport.batchId(request.body)
             var reply: Reply
             if let r = responder, let x = r(bid ?? "") { reply = x }
@@ -136,14 +154,19 @@ final class FakeTransport: Transport, @unchecked Sendable {
             return await withCheckedContinuation { c in
                 lock.withLock { hanging.append(c) }
             }
+        case .heldConfig:
+            return await withCheckedContinuation { c in
+                lock.withLock { held.append((c, cfg)) }
+            }
         }
     }
 
     func cancelAll() {
         lock.lock()
         cancelCount += 1
-        let h = hanging
+        let h = hanging + held.map(\.0)
         hanging = []
+        held = []
         lock.unlock()
         for c in h { c.resume(returning: nil) }
     }
@@ -275,11 +298,60 @@ final class Harness {
         return root.appendingPathComponent("proc-main").appendingPathComponent(c.writer.currentSessionId)
     }
 
+    /// 当前 OPEN 段里的行（不含 header）。
+    func openSegmentLines() -> [[String: Any]] {
+        guard let p = client.debugOpenSegmentPath, let s = try? String(contentsOfFile: p, encoding: .utf8) else { return [] }
+        return s.split(separator: "\n").dropFirst().compactMap { (try? JSONSerialization.jsonObject(with: Data($0.utf8))) as? [String: Any] }
+    }
+
+    func json(_ name: String) -> [String: Any]? {
+        guard let d = try? Data(contentsOf: root.appendingPathComponent(name)) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: d)) as? [String: Any]
+    }
+
     func log(_ level: LogLevel, _ msg: String, count: Int = 1, pad: Int = 0) {
         for i in 0..<count {
             client.log(level, count > 1 ? "\(msg) \(i)" + String(repeating: "p", count: pad) : msg + String(repeating: "p", count: pad))
         }
     }
+}
+
+/// 线程安全的一次性标志 / 盒子（回调里记下值，测试线程读）。
+final class Box<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _value: T?
+    var value: T? { lock.lock(); defer { lock.unlock() }; return _value }
+    func set(_ v: T) { lock.lock(); _value = v; lock.unlock() }
+}
+
+/// 真实时间（毫秒），量宿主线程上的调用耗时。
+func elapsedMs(since t0: UInt64) -> Double { Double(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e6 }
+func nowNs() -> UInt64 { clock_gettime_nsec_np(CLOCK_UPTIME_RAW) }
+
+/// 把实例的 work 队列堵住（模拟引擎忙：冷启动恢复、驱逐……），返回放行函数；最长堵 seconds 秒兜底。
+func blockWork(_ c: RetrieverClient, seconds: Double = 3) async -> @Sendable () -> Void {
+    let gate = DispatchSemaphore(value: 0)
+    let entered = Box<Bool>()
+    c.work.async {
+        entered.set(true)
+        _ = gate.wait(timeout: .now() + seconds)
+    }
+    await waitFor { entered.value == true }
+    return { gate.signal() }
+}
+
+/// purgeLocal 并等它的完成回调；返回回调里读到的 installId。
+@discardableResult
+func purgeAndWait(_ c: RetrieverClient) async -> String? {
+    await withCheckedContinuation { (k: CheckedContinuation<String?, Never>) in
+        c.purgeLocal { k.resume(returning: c.installId) }
+    }
+}
+
+/// root 同级的禁用标记 / 清空残留。
+func disabledMarker(_ root: URL) -> URL { Engine.sibling(of: root, suffix: ".disabled") }
+func purgeSiblings(_ root: URL) -> [String] {
+    FS.list(root.deletingLastPathComponent()).filter { $0.hasPrefix(root.lastPathComponent + ".purge-") }
 }
 
 /// 等后台任务（detached Task）达成条件：最长约 5 s 真实时间（与 Android 同类等待一致，负载高时不偶发），不推进假时钟。

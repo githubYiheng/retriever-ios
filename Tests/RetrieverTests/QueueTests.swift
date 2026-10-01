@@ -217,16 +217,101 @@ final class QueueTests: XCTestCase {
         XCTAssertEqual(int(halves[0]["oseq_to"]), 3)
         XCTAssertEqual(int(halves[1]["oseq_from"]), 4)
         XCTAssertEqual(int(halves[1]["oseq_to"]), 6)
+        // 半批是新批（ADR 0019 决定 11）：id 由区间两端推导，必与原批不同名；created_ms 沿用原批
         let iid = h.client.installId!
         let sid = original["session_id"] as! String
-        XCTAssertEqual(halves[0]["batch_id"] as? String, IDs.batchId(installId: iid, sessionId: sid, kind: .primary, n: 1))
-        XCTAssertEqual(halves[1]["batch_id"] as? String, IDs.batchId(installId: iid, sessionId: sid, kind: .primary, n: 4))
+        XCTAssertEqual(halves[0]["batch_id"] as? String, IDs.splitBatchId(installId: iid, sessionId: sid, oseqFrom: 1, oseqTo: 3))
+        XCTAssertEqual(halves[1]["batch_id"] as? String, IDs.splitBatchId(installId: iid, sessionId: sid, oseqFrom: 4, oseqTo: 6))
+        XCTAssertNotEqual(halves[0]["batch_id"] as? String, original["batch_id"] as? String)
+        XCTAssertEqual(int(halves[0]["created_ms"]), int(original["created_ms"]))
+        XCTAssertEqual(int(halves[1]["created_ms"]), int(original["created_ms"]))
         // ctx 跟着含 error 的那一半；p0 先发
         XCTAssertEqual(int(a["oseq_from"]), 4)
         XCTAssertTrue(lines(of: halves[1]).contains { $0["ctx"] as? Bool == true })
         XCTAssertFalse(lines(of: halves[0]).contains { $0["ctx"] as? Bool == true })
         let results = try runValidator([a, b])
         for r in results { XCTAssertEqual(r["ok"] as? Bool, true, "\(r)") }
+    }
+
+    /// 413 切分写到一半失败（第二个半批的目标路径被占住）：删掉已写的半批、原批原样保留，区间一点不丢；
+    /// 恢复写入后重切收敛为两半、原批删除（修复前：前半批与原批同名、原地覆盖，后半段静默丢失且无墓碑）。
+    func testTooLargeSplitNeverLosesRange() async throws {
+        let h = Harness(key: "")
+        await h.settle()
+        for i in 1...6 { h.client.log(.warn, "w\(i)") }
+        await h.seal()
+        let original = try XCTUnwrap(h.outboxFiles().first)
+        let env0 = try XCTUnwrap(h.envelopes().first?.1)
+        let iid = try XCTUnwrap(env0["install_id"] as? String)
+        let sid = try XCTUnwrap(env0["session_id"] as? String)
+        let halfA = OutboxName.make(prio: 1, createdMs: int(env0["created_ms"]),
+                                    batchId: IDs.splitBatchId(installId: iid, sessionId: sid, oseqFrom: 1, oseqTo: 3)!)
+        let halfB = OutboxName.make(prio: 1, createdMs: int(env0["created_ms"]),
+                                    batchId: IDs.splitBatchId(installId: iid, sessionId: sid, oseqFrom: 4, oseqTo: 6)!)
+        let block = h.outbox.appendingPathComponent(halfB)
+        try FileManager.default.createDirectory(at: block, withIntermediateDirectories: false)
+        _ = await h.work { $0.split413(original) }
+        let files = h.outboxFiles().filter { $0 != halfB }
+        XCTAssertEqual(files, [original], "已写的前半批删掉，原批原样保留")
+        let kept = try XCTUnwrap(h.envelopes().first { $0.0 == original }?.1)
+        XCTAssertEqual(lines(of: kept).compactMap { ($0["oseq"] as? NSNumber)?.int64Value }, Array(1...6))
+        XCTAssertEqual(h.readJSONL("drops.jsonl").count, 0, "没丢，也就没有墓碑")
+        // 写入恢复：重切 → 两半都提交后才删原批
+        try FileManager.default.removeItem(at: block)
+        _ = await h.work { $0.split413(original) }
+        XCTAssertEqual(h.outboxFiles(), [halfA, halfB].sorted())
+        let covered = h.envelopes().flatMap { lines(of: $0.1).compactMap { ($0["oseq"] as? NSNumber)?.int64Value } }.sorted()
+        XCTAssertEqual(covered, Array(1...6))
+        await h.enableUpload()
+        await h.tick(advance: Limits.minRequestSpacingMs)
+        XCTAssertEqual(h.outboxFiles(), [])
+        XCTAssertEqual(Set(h.transport.batchRequests.compactMap { FakeTransport.batchId($0.body) }),
+                       Set([halfA, halfB].map { String($0.dropFirst(3 + 13 + 1).dropLast(3)) }))
+    }
+
+    /// 请求头 `X-Rtv-Install` 取批自身信封（ADR 0019 决定 10）：出站箱里别的 install 的批按信封上报、不被服务端隔离；
+    /// 它确认时也不把映射记到当前 install 名下（修复前：请求头取当前值，旧批被隔离后客户端确认删除）。
+    func testBatchHeaderUsesEnvelopeInstall() async throws {
+        let root = makeTempDir()
+        let a = Harness(root: root, key: "")
+        await a.settle()
+        let oldId = try XCTUnwrap(a.client.installId)
+        a.client.log(.warn, "old install")
+        await a.seal()
+        XCTAssertNotNil(a.envelopes().first?.1["mapping"], "首批带映射")
+        a.client.simulateCrash()
+        let other = IDs.newV4()
+        try Data(InstallInfo(installId: other, sessionCounter: 5, createdMs: 1).encode()).write(to: root.appendingPathComponent("install.json"))
+
+        let b = Harness(root: root)
+        await b.settle()
+        for _ in 0..<4 where !b.outboxFiles().isEmpty { await b.tick(advance: Limits.minRequestSpacingMs) }
+        XCTAssertEqual(b.client.installId, other)
+        XCTAssertEqual(b.outboxFiles(), [])
+        let envs = b.transport.batchRequests.map { ($0, decodeEnvelope($0.body ?? Data()) ?? [:]) }
+        XCTAssertTrue(envs.contains { $0.1["install_id"] as? String == oldId })
+        for (r, e) in envs { XCTAssertEqual(r.headers["X-Rtv-Install"], e["install_id"] as? String) }
+        XCTAssertNil(b.json("mapping.json"), "别的 install 的批确认了，也不算当前 install 的映射已确认")
+    }
+
+    /// 服务端只在 stored 时写映射：回 200 + quarantined 也删批（确认），但不记映射，下一批重新带（ADR 0019 决定 10）。
+    func testQuarantinedAckDoesNotConfirmMapping() async throws {
+        let h = Harness()
+        await h.settle()
+        h.transport.responder = { bid in .status(200, ["batch_id": bid, "status": "quarantined", "config_etag": "etag-0"], [:]) }
+        h.client.log(.warn, "w1")
+        await h.sealAndDrain()
+        XCTAssertEqual(h.transport.batchRequests.count, 1)
+        XCTAssertNotNil(decodeEnvelope(h.transport.batchRequests[0].body ?? Data())?["mapping"])
+        XCTAssertEqual(h.outboxFiles(), [], "隔离回的 200 同样是确认")
+        XCTAssertNil(h.json("mapping.json"))
+        h.transport.responder = nil
+        h.clock.advance(Limits.minRequestSpacingMs)
+        h.client.log(.warn, "w2")
+        await h.sealAndDrain()
+        XCTAssertEqual(h.transport.batchRequests.count, 2)
+        XCTAssertNotNil(decodeEnvelope(h.transport.batchRequests[1].body ?? Data())?["mapping"], "下一批重新带映射")
+        XCTAssertNotNil(h.json("mapping.json"))
     }
 
     func testRateLimitedInfoBackfillPausesOnlyThoseCategories() async throws {

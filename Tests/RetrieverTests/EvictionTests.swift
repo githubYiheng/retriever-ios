@@ -142,52 +142,119 @@ final class EvictionTests: XCTestCase {
         XCTAssertEqual(h.readJSONL("drops.jsonl").count, 0)
     }
 
-    func testDropsFileCappedAndMergedByReason() async throws {
+    /// drops.jsonl 超上限（ADR 0019 决定 4）：只做无损合并（同会话、同 reason、区间相接），n == 区间长度，
+    /// 不跨会话、不跨 reason、绝不盖住输入里没有的 oseq；仍超出删最旧的（修复前：按 reason 并成 [min, max]，盖住真实缺口）。
+    func testDropsFileCapOnlyLosslessMerge() async throws {
         let h = Harness(key: "")
         await h.settle()
         let sid = h.client.writer.currentSessionId
+        let other = IDs.newV4()
         var entries: [DropEntry] = []
-        for i in 1...1100 {
-            let o = Int64(i) * 2
-            let reason = i % 2 == 0 ? "write_failed" : "buffer_overflow"
-            entries.append(DropEntry(sessionId: sid, oseqFrom: o, oseqTo: o, n: 1, reason: reason, atMs: Int64(i), lastAckAgeMs: -1))
+        var dropped = Set<String>()
+        func add(_ s: String, _ o: Int64, _ reason: String = "buffer_overflow") {
+            entries.append(DropEntry(sessionId: s, oseqFrom: o, oseqTo: o, n: 1, reason: reason, atMs: Int64(entries.count), lastAckAgeMs: -1))
+            dropped.insert("\(s)|\(reason)|\(o)")
         }
+        // 同会话 1100 条稀疏（间隔 3）；前 150 条各跟一条相接的（可无损合并）
+        for i in 1...1100 {
+            add(sid, Int64(i) * 3)
+            if i <= 150 { add(sid, Int64(i) * 3 + 1) }
+        }
+        add(other, 4)                       // 数值上与 [3, 4] 相接，但属于别的会话
+        add(sid, 5, "write_failed")         // 与 [3, 4] 相接，但 reason 不同
         let all = entries
-        _ = await h.work { e in e.appendDrops(all) }
+        _ = await h.work { $0.appendDrops(all) }
         let drops = h.readJSONL("drops.jsonl")
-        XCTAssertLessThanOrEqual(drops.count, ClientConstants.dropsFileMaxEntries)
-        XCTAssertEqual(drops.reduce(Int64(0)) { $0 + int($1["n"]) }, 1100, "合并计数不丢")
-        XCTAssertEqual(Set(drops.map { $0["reason"] as? String }), ["write_failed", "buffer_overflow"])
-        // 单批 ≤ 100 条，超出按 reason 合并
-        h.client.log(.warn, "carrier")
-        await h.seal()
-        let env = try XCTUnwrap(h.envelopes().first?.1)
-        let d = try XCTUnwrap(env["drops"] as? [[String: Any]])
-        XCTAssertLessThanOrEqual(d.count, Limits.dropsPerBatch)
-        XCTAssertEqual(d.reduce(Int64(0)) { $0 + int($1["n"]) }, 1100)
-        let results = try runValidator([env])
-        XCTAssertEqual(results.first?["ok"] as? Bool, true, "\(results)")
+        XCTAssertEqual(drops.count, ClientConstants.dropsFileMaxEntries)
+        for d in drops {
+            let (f, t) = (int(d["oseq_from"]), int(d["oseq_to"]))
+            XCTAssertEqual(int(d["n"]), t - f + 1, "n == 区间长度")
+            for o in f...t {
+                XCTAssertTrue(dropped.contains("\(d["session_id"] as! String)|\(d["reason"] as! String)|\(o)"), "盖住了输入里没有的 oseq \(o)")
+            }
+        }
+        XCTAssertTrue(drops.contains { int($0["oseq_from"]) == 450 && int($0["oseq_to"]) == 451 && int($0["n"]) == 2 }, "相接的并成一条")
+        XCTAssertTrue(drops.contains { $0["session_id"] as? String == other && int($0["oseq_from"]) == 4 }, "不跨会话")
+        XCTAssertTrue(drops.contains { $0["reason"] as? String == "write_failed" && int($0["oseq_from"]) == 5 }, "不跨 reason")
+        XCTAssertFalse(drops.contains { int($0["oseq_from"]) == 3 }, "仍超出：删最旧的")
     }
 
-    func testClosedSessionsCappedAtTwenty() async throws {
+    /// 墓碑携带（ADR 0019 决定 2）：每批按文件顺序带最旧的、未在途的 100 条，各自会话与精确区间，不合并、不改写文件；
+    /// 带不完的留给下一批（修复前：> 100 条先按 reason 合并并改写文件）。
+    func testDropsCarriedUnmergedOldestFirst() async throws {
         let h = Harness(key: "")
         await h.settle()
-        let closed = (1...25).map { i in
+        let sids = (0..<150).map { _ in IDs.newV4() }
+        let entries = sids.enumerated().map { i, s in
+            DropEntry(sessionId: s, oseqFrom: 5, oseqTo: 7, n: 3, reason: "buffer_overflow", atMs: Int64(i), lastAckAgeMs: -1)
+        }
+        _ = await h.work { $0.appendDrops(entries) }
+        let file = h.root.appendingPathComponent("drops.jsonl")
+        let before = try Data(contentsOf: file)
+        h.client.log(.warn, "carrier 1")
+        await h.seal()
+        h.client.log(.warn, "carrier 2")
+        await h.seal()
+        XCTAssertEqual(try Data(contentsOf: file), before, "携带不改写文件")
+        let envs = h.envelopes().map(\.1).sorted { int($0["oseq_from"]) < int($1["oseq_from"]) }
+        XCTAssertEqual(envs.count, 2)
+        let d1 = try XCTUnwrap(envs[0]["drops"] as? [[String: Any]])
+        let d2 = try XCTUnwrap(envs[1]["drops"] as? [[String: Any]])
+        XCTAssertEqual(d1.map { $0["session_id"] as? String }, Array(sids.prefix(100)))
+        XCTAssertEqual(d2.map { $0["session_id"] as? String }, Array(sids.suffix(50)))
+        XCTAssertTrue((d1 + d2).allSatisfy { int($0["oseq_from"]) == 5 && int($0["oseq_to"]) == 7 && int($0["n"]) == 3 })
+        let results = try runValidator(envs)
+        for r in results { XCTAssertEqual(r["ok"] as? Bool, true, "\(r)") }
+    }
+
+    /// 终态携带（ADR 0019 决定 2）：每批按文件顺序带最旧的、未在途的 20 条，带不完的留给下一批；不再截断计数、不改写文件
+    /// （修复前：> 20 条时最旧的被删除，只留 closed_sessions_dropped 计数）。2xx 后删除已报条目。
+    func testTerminalsCarriedOldestFirstNeverDropped() async throws {
+        let h = Harness(key: "")
+        await h.settle()
+        let closed = (1...30).map { i in
             ClosedSession(sessionId: IDs.newV4(), sessionNo: Int64(i), startedMs: Int64(i) * 1000, endedMs: Int64(i) * 1000 + 500,
                           lastSeq: 10, lastOseq: 2, exit: "clean_bg")
         }
-        FS.append(h.root.appendingPathComponent("sessions.jsonl"), JSONL.encodeClosed(closed))
-        h.client.log(.warn, "carrier")
+        let file = h.root.appendingPathComponent("sessions.jsonl")
+        FS.append(file, JSONL.encodeClosed(closed))
+        let before = try Data(contentsOf: file)
+        h.client.log(.warn, "carrier 1")
         await h.seal()
-        let env = try XCTUnwrap(h.envelopes().first?.1)
-        let cs = try XCTUnwrap(env["closed_sessions"] as? [[String: Any]])
-        XCTAssertEqual(cs.count, Limits.closedSessionsPerBatch)
-        XCTAssertEqual(int(env["closed_sessions_dropped"]), 5)
-        XCTAssertEqual(Set(cs.map { int($0["session_no"]) }), Set(6...25))
-        XCTAssertEqual(h.readJSONL("sessions.jsonl").count, 20, "更旧的 5 条已合并为计数")
+        h.client.log(.warn, "carrier 2")
+        await h.seal()
+        XCTAssertEqual(try Data(contentsOf: file), before, "携带不改写文件")
+        let envs = h.envelopes().map(\.1).sorted { int($0["oseq_from"]) < int($1["oseq_from"]) }
+        XCTAssertEqual(envs.count, 2)
+        XCTAssertEqual((envs[0]["closed_sessions"] as? [[String: Any]])?.map { int($0["session_no"]) }, Array(1...20))
+        XCTAssertEqual((envs[1]["closed_sessions"] as? [[String: Any]])?.map { int($0["session_no"]) }, Array(21...30))
+        XCTAssertTrue(envs.allSatisfy { $0["closed_sessions_dropped"] == nil }, "信封不再出现 closed_sessions_dropped")
         // 2xx 后删除已报条目
         await h.enableUpload()
+        await h.tick(advance: Limits.minRequestSpacingMs)
         XCTAssertEqual(h.outboxFiles(), [])
         XCTAssertEqual(h.readJSONL("sessions.jsonl").count, 0)
+    }
+
+    /// sessions.jsonl 上限 1000 条（ADR 0019 决定 3）：追加后超出删最旧的未在途条目；在途（已嵌进出站箱批次）的不删。
+    func testSessionsFileCapDropsOldestNotInFlight() async throws {
+        let h = Harness(key: "")
+        await h.settle()
+        func closed(_ r: ClosedRange<Int>) -> [ClosedSession] {
+            r.map { ClosedSession(sessionId: IDs.newV4(), sessionNo: Int64($0), startedMs: 1, endedMs: 2, lastSeq: 1, lastOseq: 1, exit: "clean_bg") }
+        }
+        let file = h.root.appendingPathComponent("sessions.jsonl")
+        FS.append(file, JSONL.encodeClosed(closed(1...20)))
+        h.client.log(.warn, "carrier")
+        await h.seal()                                              // 1…20 在途
+        FS.append(file, JSONL.encodeClosed(closed(21...1005)))
+        let last = closed(1006...1006)[0]
+        let ok = await h.work { $0.appendClosed(last) }
+        XCTAssertTrue(ok)
+        let nos = h.readJSONL("sessions.jsonl").map { int($0["session_no"]) }
+        XCTAssertEqual(nos.count, ClientConstants.sessionsFileMaxEntries)
+        XCTAssertEqual(Array(nos.prefix(20)), Array(1...20), "在途的不删")
+        XCTAssertEqual(Array(nos.dropFirst(20).prefix(1)), [27], "删的是最旧的未在途条目 21…26")
+        XCTAssertEqual(nos.last, 1006)
     }
 }
