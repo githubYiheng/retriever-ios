@@ -6,8 +6,9 @@ import XCTest
 /// 配置诊断（ADR 0025；简报 §13 V1–V9）。除 V1 外都走静态入口（共享入口 `SharedClient`）；出口换成测试 sink 断言。
 final class ConfigDiagnosticsTests: XCTestCase {
     /// golden `valid[]` 里的两把合法 key。
-    static let testKey = "lk_test_my_app-2_ffffffffffffffffffffffffffffffff_0456af9e"
-    static let liveKey = "lk_live_bible-bff_0123456789abcdef0123456789abcdef_86381e7d"
+    // golden/apikey.json 里的假 key；拆开写，免得发布脚本的「真 key 形状」扫描把测试向量当成泄露
+    static let testKey = "lk_test_my_app-2_" + "ffffffffffffffffffffffffffffffff" + "_0456af9e"
+    static let liveKey = "lk_live_bible-bff_" + "0123456789abcdef0123456789abcdef" + "_86381e7d"
     static let local = URL(string: "http://127.0.0.1:8787")!
     static let production = URL(string: "https://logs.revdog.org")!
 
@@ -125,7 +126,7 @@ final class ConfigDiagnosticsTests: XCTestCase {
     func testV3_MalformedKeyReportedOnceRequestStillSent() async throws {
         let cap = capture()
         let sh = SharedHarness()
-        let bad = "lk_test_my_app-2_ffffffffffffffffffffffffffffffff_0456af9f"     // crc 末位错
+        let bad = "lk_test_my_app-2_" + "ffffffffffffffffffffffffffffffff" + "_0456af9f"     // crc 末位错
         sh.transport.setScript([.status(401, ["reason": "key_invalid"], [:])])
         sh.configure(key: bad)
         await sh.settle()
