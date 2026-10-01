@@ -170,7 +170,7 @@ extension Engine {
         var ls: [L] = []
         for raw in p.lines {
             guard let pre = Segments.parsePrefix(raw, 0..<raw.count) else { continue }
-            ls.append(L(raw: raw, seq: pre.seq, oseq: pre.oseq, ts: pre.ts, rank: pre.levelRank, ctx: Bytes.contains(Engine.ctxMark, in: raw[...])))
+            ls.append(L(raw: raw, seq: pre.seq, oseq: pre.oseq, ts: pre.ts, rank: pre.levelRank, ctx: Segments.tail(raw[...]).ctx))
         }
         let oblig = ls.filter { !$0.ctx && $0.oseq > 0 }
         var ctx = ls.filter { $0.ctx }
@@ -248,6 +248,8 @@ extension Engine {
     /// 顺序：RETAINED 段最旧优先（无义务不记墓碑；> 7 d 无条件删）→ p2（backfill_evicted）【以上按余量额度】
     /// → q（quarantine_evicted）→ p1（buffer_overflow）→ p0（buffer_overflow）【按硬上限】。当前 OPEN 段永不驱逐。
     func evictIfNeeded() {
+        // 旧会话恢复完成之前一律不驱逐（含 applyEffective 因上限变化、tick 触发的路径；盲审 🔴1）
+        guard evictionAllowed else { return }
         let nowWall = clock.wallMs()
         struct Seg { var url: URL; var size: Int64; var mtime: Int64; var segNo: Int }
         var sealed: [Seg] = []
@@ -267,6 +269,21 @@ extension Engine {
         }
         reconcileOutbox()
         for m in metas.values { total += m.bytes }
+        // pre 文件计入本地总量（R-5）；不属于任何活进程（flock 可得）且 mtime 超过 7 天的删掉（ADR 0023）。
+        // 只管默认 root 下的 pre 目录（appGroup 实例的 root 里没有 pre 文件）
+        var preBytes: Int64 = 0
+        if adoptsOrphans {
+            for name in FS.list(preDir) where PreName.isValid(name) {
+                let url = preDir.appendingPathComponent(name)
+                let size = FS.size(url) ?? 0
+                if nowWall - (FS.mtimeMs(url) ?? nowWall) > ClientConstants.preOrphanMaxAgeMs,
+                   FS.withFreeFileLock(url, { _ = unlink(url.path) }) {
+                    continue
+                }
+                preBytes += size
+            }
+        }
+        total += preBytes
 
         let hardCap = Int64(effective.config.localCapBytes)
         var softCap = hardCap
@@ -275,13 +292,12 @@ extension Engine {
             softCap = min(hardCap, max(0, total + avail - ClientConstants.diskReserveBytes))
         }
         sealed.sort { ($0.mtime, $0.segNo) < ($1.mtime, $1.segNo) }
-        var tombs: [DropEntry] = []
+        // 先记墓碑、再删（盲审裁决 7）：墓碑写不成（拿不到 root 目录锁、盘满）本轮不驱逐这一项，下次再来
         let maxAge = Int64(Limits.ringMaxAgeDays) * ClientConstants.dayMs
         var remaining: [Seg] = []
         for s in sealed {
             if nowWall - s.mtime > maxAge {
-                total -= s.size
-                evictSegment(s.url, now: nowWall, tombs: &tombs)
+                if evictSegment(s.url, now: nowWall) { total -= s.size }
             } else {
                 remaining.append(s)
             }
@@ -292,11 +308,10 @@ extension Engine {
                         targetSeq: cur.sealed.last?.lastSeq ?? 0, noCtx: false, ignoreCap: true)
             reconcileOutbox()
             total = remaining.reduce(0) { $0 + $1.size } + metas.values.reduce(0) { $0 + $1.bytes }
-                + (FS.size(writer.currentSegmentURL ?? URL(fileURLWithPath: "/nonexistent")) ?? 0)
+                + (FS.size(writer.currentSegmentURL ?? URL(fileURLWithPath: "/nonexistent")) ?? 0) + preBytes
         }
         for s in remaining where total > softCap {
-            total -= s.size
-            evictSegment(s.url, now: nowWall, tombs: &tombs)
+            if evictSegment(s.url, now: nowWall) { total -= s.size }
         }
         if total > softCap {
             for prio in [2, 3, 1, 0] {
@@ -305,29 +320,30 @@ extension Engine {
                 let batch = metas.values.filter { $0.prio == prio && $0.name != inFlight }
                     .sorted { ($0.createdMs, $0.name) < ($1.createdMs, $1.name) }
                 for m in batch where total > cap {
-                    total -= m.bytes
-                    evictBatch(m, now: nowWall, tombs: &tombs)
+                    if evictBatch(m, now: nowWall) { total -= m.bytes }
                 }
             }
         }
-        if !tombs.isEmpty { appendDrops(tombs) }
     }
 
-    private func evictSegment(_ url: URL, now: Int64, tombs: inout [DropEntry]) {
+    /// 驱逐一个 RETAINED 段；它若带未物化的义务行，先把墓碑写成再删。返回是否删了。
+    @discardableResult
+    private func evictSegment(_ url: URL, now: Int64) -> Bool {
         for s in ownSessions {
             guard let idx = s.sealed.firstIndex(where: { $0.url.path == url.path }) else { continue }
             let info = s.sealed[idx]
             if info.obligCount > 0 && info.lastOseq > s.cursor.extractedThroughOseq {
                 let from = max(info.firstOseq, s.cursor.extractedThroughOseq + 1)
-                tombs.append(DropEntry(sessionId: s.meta.sessionId, oseqFrom: from, oseqTo: info.lastOseq,
-                                       n: info.lastOseq - from + 1, reason: DropReason.bufferOverflow.rawValue,
-                                       atMs: now, lastAckAgeMs: lastAckAge(now)))
+                let tomb = DropEntry(sessionId: s.meta.sessionId, oseqFrom: from, oseqTo: info.lastOseq,
+                                     n: info.lastOseq - from + 1, reason: DropReason.bufferOverflow.rawValue,
+                                     atMs: now, lastAckAgeMs: lastAckAge(now))
+                guard appendDrops([tomb]) else { return false }
             }
             s.sealed.remove(at: idx)
             if s !== current && s.sealed.isEmpty && s.cursor.closedMs != nil {
                 others.removeValue(forKey: s.meta.sessionId)
                 FS.remove(s.dir)
-                return
+                return true
             }
             // seq 高水位：被驱逐段的行不可能再作 ctx，记进 ctx 游标语义正确、不改磁盘格式，
             // 恢复时 maxSeq 取它，合成行的 seq 不会回退到已用过的号
@@ -345,9 +361,25 @@ extension Engine {
            dir.deletingLastPathComponent().path != procDir.path {
             FS.remove(dir)
         }
+        return true
     }
 
-    private func evictBatch(_ m: BatchMeta, now: Int64, tombs: inout [DropEntry]) {
+    /// 驱逐一个出站箱批：义务批（含 backfill / 隔离）先把墓碑写成再删。返回是否删了。
+    @discardableResult
+    private func evictBatch(_ m: BatchMeta, now: Int64) -> Bool {
+        if !m.sessionId.isEmpty {
+            let age = lastAckAge(now)
+            var tomb: DropEntry?
+            if m.kind == .backfill {
+                tomb = DropEntry(sessionId: m.sessionId, oseqFrom: 0, oseqTo: 0, n: Int64(max(m.lineCount, 1)),
+                                 reason: DropReason.backfillEvicted.rawValue, atMs: now, lastAckAgeMs: age)
+            } else if m.oseqFrom > 0 {
+                let reason = m.prio == 3 ? DropReason.quarantineEvicted : DropReason.bufferOverflow
+                tomb = DropEntry(sessionId: m.sessionId, oseqFrom: m.oseqFrom, oseqTo: m.oseqTo, n: m.oseqTo - m.oseqFrom + 1,
+                                 reason: reason.rawValue, atMs: now, lastAckAgeMs: age)
+            }
+            if let t = tomb, !appendDrops([t]) { return false }
+        }
         FS.remove(outboxDir.appendingPathComponent(m.name))
         metas.removeValue(forKey: m.name)
         fails.removeValue(forKey: m.name)
@@ -355,15 +387,6 @@ extension Engine {
         embeddedDrops.subtract(m.drops)
         embeddedClosed.subtract(m.closed.map(\.sessionId))
         if let u = m.mappingUser, let p = pendingMapping, p.user == u, p.digest == m.mappingDigest { pendingMapping = nil }
-        guard !m.sessionId.isEmpty else { return }
-        let age = lastAckAge(now)
-        if m.kind == .backfill {
-            tombs.append(DropEntry(sessionId: m.sessionId, oseqFrom: 0, oseqTo: 0, n: Int64(max(m.lineCount, 1)),
-                                   reason: DropReason.backfillEvicted.rawValue, atMs: now, lastAckAgeMs: age))
-        } else if m.oseqFrom > 0 {
-            let reason = m.prio == 3 ? DropReason.quarantineEvicted : DropReason.bufferOverflow
-            tombs.append(DropEntry(sessionId: m.sessionId, oseqFrom: m.oseqFrom, oseqTo: m.oseqTo, n: m.oseqTo - m.oseqFrom + 1,
-                                   reason: reason.rawValue, atMs: now, lastAckAgeMs: age))
-        }
+        return true
     }
 }

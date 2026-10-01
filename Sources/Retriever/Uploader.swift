@@ -6,7 +6,8 @@ import Darwin
 /// 出站队列与响应分类（§3.6 / §3.7，宪法 R-2 / R-3）。决策在 work 队列上，网络在队列外。
 extension Engine {
     enum SendStep {
-        case send(name: String, request: HTTPRequest)
+        /// `keyFp`：发这一批用的 key 指纹（响应回来时与当前比较，ADR 0024 决定 7）。
+        case send(name: String, request: HTTPRequest, keyFp: String)
         case stop(reason: String, wakeMono: Int64?)
     }
 
@@ -63,7 +64,7 @@ extension Engine {
             ], body: Data(body))
             inFlight = pick.name
             lastRequestMono = nowMono
-            return .send(name: pick.name, request: req)
+            return .send(name: pick.name, request: req, keyFp: keyFp)
         }
         return .stop(reason: "unreadable", wakeMono: nil)
     }
@@ -92,25 +93,31 @@ extension Engine {
 
     // MARK: 响应分类
 
-    func handleResponse(name: String, response: HTTPResponse?) -> ResponseEffect {
+    /// `keyFp`：请求用的 key 指纹；`sdkCancelled`：SDK 自己取消的（purge、后台到期）——不计毒批失败（ADR 0024 决定 10）。
+    func handleResponse(name: String, response: HTTPResponse?, keyFp reqFp: String? = nil, sdkCancelled: Bool = false) -> ResponseEffect {
         var eff = ResponseEffect()
         if inFlight == name { inFlight = nil }
         guard let meta = metas[name] else { return eff }
         guard let r = response else {
-            failure(name, retryAfterS: nil, reason: "network", countFail: true)
+            // SDK 自己取消的请求：既不计毒批失败、也不推高退避（盲审裁决 11）
+            if !sdkCancelled { failure(name, retryAfterS: nil, reason: "network", countFail: true) }
             return eff
         }
+        let staleKey = reqFp.map { $0 != keyFp } ?? false
         let body = JSONIn.object(r.body)
         switch r.status {
         case 200..<300:
             // 回显的 batch_id 与本批一致才算确认（防 captive portal）；stored 与 quarantined 都算
             if let b = body, (b["batch_id"] as? String) == meta.batchId {
-                ack(meta, stored: (b["status"] as? String) == "stored")
+                ack(meta, stored: (b["status"] as? String) == "stored", currentTarget: !staleKey)
                 eff.acked = true
                 if let e = b["config_etag"] as? String, e != (configCache?.config.etag ?? "") { eff.fetchConfig = true }
             } else {
                 failure(name, retryAfterS: nil, reason: "echo_mismatch", countFail: true)
             }
+        case 401 where staleKey, 403 where staleKey:
+            // 旧 key 的在途请求：不暂停新 key、不计失败；批留在出站箱，下一轮用当前 key 重发（ADR 0024 决定 7）
+            break
         case 401, 403:
             // 只认服务端的明确表态（JSON 对象且 reason 是字符串，未知值同样算）；边缘 / WAF / captive portal 替服务端回的
             // 401 / 403（HTML、空体、无 reason）按「其它」：全局退避 + 计毒批（ADR 0011）
@@ -154,7 +161,7 @@ extension Engine {
         return jitter(base)
     }
 
-    private func ack(_ meta: BatchMeta, stored: Bool) {
+    private func ack(_ meta: BatchMeta, stored: Bool, currentTarget: Bool) {
         let nowWall = clock.wallMs()
         FS.remove(outboxDir.appendingPathComponent(meta.name))
         metas.removeValue(forKey: meta.name)
@@ -164,9 +171,9 @@ extension Engine {
             ackedRanges.append((meta.sessionId, meta.oseqFrom, meta.oseqTo))
             if ackedRanges.count > 512 { ackedRanges.removeFirst(ackedRanges.count - 512) }
         }
-        // 删已报墓碑与会话终态（按原样匹配）
+        // 删已报墓碑与会话终态（按原样匹配）。拿不到 root 目录锁：条目留在 jsonl、本进程仍按在途不重复带，下个进程再报
         if !meta.drops.isEmpty || !meta.closed.isEmpty {
-            FS.withDirLock(root) {
+            let done: Bool? = FS.withDirLock(root) {
                 if !meta.drops.isEmpty {
                     let gone = Set(meta.drops)
                     let rest = readDropsLocked().filter { !gone.contains($0) }
@@ -177,15 +184,18 @@ extension Engine {
                     let rest = readClosedLocked().filter { !gone.contains($0.sessionId) }
                     FS.writeAtomic(sessionsURL, JSONL.encodeClosed(rest))
                 }
+                return true
             }
-            embeddedDrops.subtract(meta.drops)
-            embeddedClosed.subtract(meta.closed.map(\.sessionId))
+            if done == true {
+                embeddedDrops.subtract(meta.drops)
+                embeddedClosed.subtract(meta.closed.map(\.sessionId))
+            }
         }
         if let u = meta.mappingUser, let d = meta.mappingDigest {
-            // 服务端只在 stored 时写 D1 映射：隔离回的 200 不算映射已确认；别的 install 的批也不算（ADR 0019 决定 10）。
-            // 在途标记照样清掉，下一批重新带映射
-            if stored && meta.installId == install?.installId {
-                let m = MappingState(userId: u, deviceDigest: d, ackedMs: nowWall)
+            // 服务端只在 stored 时写 D1 映射：隔离回的 200 不算映射已确认；别的 install 的批也不算（ADR 0019 决定 10）；
+            // 旧上传目标（换 key / baseURL 之前发出）的确认也不算（ADR 0024 决定 7）。在途标记照样清掉，下一批重新带映射
+            if stored && currentTarget && meta.installId == install?.installId {
+                let m = MappingState(userId: u, deviceDigest: d, ackedMs: nowWall, keyFp: keyFp, baseURL: baseURL.absoluteString)
                 mapping = m
                 FS.writeAtomic(mappingURL, m.encode())
             }
@@ -265,6 +275,7 @@ extension Engine {
     /// 配置请求与它所属的身份；未配置 key、未 bootstrap、禁用（内存开关或盘上标记）时不拉（ADR 0020 决定 2）。
     func configRequest() -> (request: HTTPRequest, identity: ConfigIdentity)? {
         guard !key.isEmpty, uploadAllowed(), let inst = install else { return nil }
+        let host = self.host
         var h: [String: String] = [
             "Authorization": "Bearer \(key)",
             "X-Rtv-Install": inst.installId,
@@ -283,14 +294,15 @@ extension Engine {
         // 发起即记尝试时刻（响应回来再记一次）：在途期间轮询候选不会停在过去，调度器不空转
         lastConfigFetchMono = clock.monoMs()
         return (HTTPRequest(method: "GET", url: baseURL.appendingPathComponent("v1/config"), headers: h, body: nil),
-                ConfigIdentity(installId: inst.installId, userId: user))
+                ConfigIdentity(installId: inst.installId, userId: user, host: host, keyFp: keyFp, baseURL: baseURL.absoluteString))
     }
 
     static let asciiAlnum = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
 
-    /// 当前身份 (install_id, user_id)；未 bootstrap 为 nil。
+    /// 当前身份（install_id, user_id, 四项宿主默认, key 指纹, baseURL）；未 bootstrap 为 nil。
     var configIdentity: ConfigIdentity? {
-        install.map { ConfigIdentity(installId: $0.installId, userId: writer.currentUser) }
+        install.map { ConfigIdentity(installId: $0.installId, userId: writer.currentUser, host: host, keyFp: keyFp,
+                                     baseURL: baseURL.absoluteString) }
     }
 
     /// 身份变了（setUser 值变化）：缓存从此刻起按过期处理，放大型字段立即回落保守默认（ADR 0019 决定 12）；
@@ -308,13 +320,11 @@ extension Engine {
         guard configIdentity == identity else { return ConfigEffect(stale: true) }
         guard let r, r.status == 200, let o = JSONIn.object(r.body) else { return ConfigEffect() }
         let cfg = ConfigRules.clamp(o, host: host)
+        let fromHost = ConfigRules.parseFromHost(o["from_host"])
         let nowWall = clock.wallMs()
-        configCache = ConfigCache(config: cfg, fetchedWallMs: nowWall, fetchedMonoMs: clock.monoMs())
-        var file = JSONOut()
-        file.raw("{\"fetched_ms\":"); file.int(nowWall)
-        file.raw(",\"config\":"); file.raw(ConfigRules.encode(cfg))
-        file.raw("}")
-        FS.writeAtomic(configURL, file.bytes)
+        configCache = ConfigCache(config: cfg, fetchedWallMs: nowWall, fetchedMonoMs: clock.monoMs(), fromHost: fromHost,
+                                  userId: identity.userId)
+        persistConfigCache()
         return applyEffective()
     }
 
@@ -330,8 +340,8 @@ extension Engine {
     func applyEffective() -> ConfigEffect {
         var eff = ConfigEffect()
         let old = effective
-        effective = ConfigCache.effective(configCache, host: host, nowWall: clock.wallMs(), nowMono: clock.monoMs())
-        writer.setLevels(upload: effective.uploadLevel, local: effective.config.localLevel, flushIntervalS: effective.config.flushIntervalS)
+        // 缓存快照推给写入侧，由它（与宿主默认同一处）重算生效级别
+        effective = writer.setConfigCache(configCache)
         if !old.fullDumpActive && effective.fullDumpActive {
             writer.rotate(.fullDump)
             processSeals()

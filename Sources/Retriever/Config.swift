@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// 远程配置（方案 §5；packages/core/src/config.ts）。
 struct RemoteConfig: Equatable, Sendable {
@@ -21,7 +22,7 @@ struct HostDefaults: Sendable, Equatable {
     var uploadLevel: LogLevel
     var localLevel: LogLevel?
     var dailyBatchCap: Int?
-    /// 宿主 `localCapBytes`（缓存过期时 local_cap 放大回落的目标；不参与 clampConfig）。
+    /// 宿主 `localCapBytes`（clamp 时 local_cap_bytes 的回落值，与 config.ts 一致；也是缓存过期时 local_cap 放大回落的目标）。
     var localCapBytes: Int = Limits.localCapBytesDefault
 
     init(uploadLevel: LogLevel, localLevel: LogLevel? = nil, dailyBatchCap: Int? = nil, localCapBytes: Int = Limits.localCapBytesDefault) {
@@ -58,7 +59,9 @@ enum ConfigRules {
             contextLines: clampInt(JSONIn.double(r["context_lines"]), 0, Limits.ctxLinesMax, Limits.ctxLinesDefault),
             contextBytes: clampInt(JSONIn.double(r["context_bytes"]), 0, Limits.ctxBytesMax, Limits.ctxBytesDefault),
             flushIntervalS: clampInt(JSONIn.double(r["flush_interval_s"]), Limits.flushIntervalSMin, Limits.flushIntervalSMax, Limits.flushIntervalSDefault),
-            localCapBytes: clampInt(JSONIn.double(r["local_cap_bytes"]), Limits.localCapBytesMin, Limits.localCapBytesMax, Limits.localCapBytesDefault),
+            // 缺省 / 畸形回落宿主值（与权威实现 config.ts 一致，ADR 0022）
+            localCapBytes: clampInt(JSONIn.double(r["local_cap_bytes"]), Limits.localCapBytesMin, Limits.localCapBytesMax,
+                                    clampHostCap(host.localCapBytes)),
             fullDump: JSONIn.bool(r["full_dump"]) ?? false,
             fullDumpTtlS: clampInt(JSONIn.double(r["full_dump_ttl_s"]), 0, fullDumpTtlSMax, 0),
             dailyBatchCap: clampInt(JSONIn.double(r["daily_batch_cap"]), 0, Limits.dailyBatchCapMax, hostCap)
@@ -83,6 +86,32 @@ enum ConfigRules {
         Swift.min(Swift.max(v, Limits.localCapBytesMin), Limits.localCapBytesMax)
     }
 
+    /// 宿主型字段（ADR 0022）：没有任何远程层给出有效值时，服务端取请求头里的宿主默认，并在 `from_host` 里列出。
+    static let hostFields = ["upload_level", "local_level", "local_cap_bytes", "daily_batch_cap"]
+
+    /// `hostDerivedFields`（config.ts）逐字移植：raw 交给 clamp 时哪些宿主型字段取宿主回落。SDK 自己不需要它
+    /// （`from_host` 由服务端给出）；测试的假服务端用它模拟 ingest 的回显，golden `from_host[]` 校验它。
+    static func hostDerivedFields(_ raw: Any?) -> [String] {
+        let r: [String: Any] = (raw as? [String: Any]) ?? [:]
+        return hostFields.filter { f in
+            if f == "upload_level" || f == "local_level" { return level(r[f]) == nil }
+            guard let d = JSONIn.double(r[f]) else { return true }
+            return !d.isFinite
+        }
+    }
+
+    /// 响应 / 缓存里的 `from_host`：只认四个宿主型字段名；缺失、非数组 → 空集（旧服务端 / 旧缓存 = 现状行为）。
+    static func parseFromHost(_ v: Any?) -> Set<String> {
+        guard let a = v as? [Any] else { return [] }
+        return Set(a.compactMap { $0 as? String }.filter { hostFields.contains($0) })
+    }
+
+    /// key 指纹（ADR 0024 决定 7）：sha256(key 的 UTF-8) 前 16 位小写十六进制；key 为空 → 空串。
+    static func keyFingerprint(_ key: String) -> String {
+        guard !key.isEmpty else { return "" }
+        return SHA256.hash(data: Data(key.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
+    }
+
     /// 序列化成与服务端同名字段的 JSON（缓存到 config.json）。
     static func encode(_ c: RemoteConfig) -> [UInt8] {
         var o = JSONOut()
@@ -103,10 +132,14 @@ enum ConfigRules {
     }
 }
 
-/// 配置请求时的身份（ADR 0019 决定 12）：响应只在它仍等于当前身份时缓存并生效。
+/// 配置请求时的身份（ADR 0019 决定 12；ADR 0022 加宿主默认；ADR 0024 决定 7 加 key 指纹与 baseURL）：
+/// 响应只在它仍等于当前身份时缓存并生效，否则丢弃并重拉。
 struct ConfigIdentity: Equatable, Sendable {
     var installId: String
     var userId: String?
+    var host: HostDefaults
+    var keyFp: String
+    var baseURL: String
 }
 
 /// 生效配置：缓存 + 到期回落（§5）。
@@ -127,6 +160,10 @@ struct ConfigCache: Sendable {
     /// 身份（install_id, user_id）变了（ADR 0019 决定 12）：这份配置属于上一个身份，按过期处理直到新身份的响应到达
     /// （新响应是新的缓存对象，标志随之清掉）。只在内存，不写进 config.json。
     var identityStale = false
+    /// 响应里标为「取自宿主默认」的字段（ADR 0022）：生效时取**当前**宿主默认，不取缓存值。
+    var fromHost: Set<String> = []
+    /// 这份配置所属请求身份的用户（落盘为 config.json 的 `user_id`）。
+    var userId: String? = nil
 
     func elapsedMs(nowWall: Int64, nowMono: Int64) -> Int64 {
         if let m = fetchedMonoMs { return nowMono - m }
@@ -139,11 +176,17 @@ struct ConfigCache: Sendable {
     /// buffer_overflow 驱逐。
     static func effective(_ cache: ConfigCache?, host: HostDefaults, nowWall: Int64, nowMono: Int64) -> EffectiveConfig {
         guard let cache else {
-            var c = ConfigRules.clamp([String: Any](), host: host)
-            c.localCapBytes = host.localCapBytes
+            let c = ConfigRules.clamp([String: Any](), host: host)
             return EffectiveConfig(config: c, fullDumpActive: false, uploadLevel: c.uploadLevel, expired: true)
         }
         var c = cache.config
+        // 缓存只记远程明确给的值：from_host 里的字段取当前宿主默认（按 clamp 规则钳制）
+        if cache.fromHost.contains("upload_level") { c.uploadLevel = host.uploadLevel }
+        if cache.fromHost.contains("local_level") { c.localLevel = host.localLevel ?? .debug }
+        if cache.fromHost.contains("local_cap_bytes") { c.localCapBytes = ConfigRules.clampHostCap(host.localCapBytes) }
+        if cache.fromHost.contains("daily_batch_cap") {
+            c.dailyBatchCap = ConfigRules.clampInt(host.dailyBatchCap.map { Double($0) }, 0, Limits.dailyBatchCapMax, Limits.dailyBatchCapDefault)
+        }
         let elapsed = cache.elapsedMs(nowWall: nowWall, nowMono: nowMono)
         let ttlExpired = elapsed < 0 || elapsed >= Int64(c.ttlS) * 1000
         let expired = cache.identityStale || ttlExpired
@@ -154,7 +197,8 @@ struct ConfigCache: Sendable {
             if c.contextLines > Limits.ctxLinesDefault { c.contextLines = Limits.ctxLinesDefault }
             if c.contextBytes > Limits.ctxBytesDefault { c.contextBytes = Limits.ctxBytesDefault }
             if c.flushIntervalS < Limits.flushIntervalSDefault { c.flushIntervalS = Limits.flushIntervalSDefault }
-            if ttlExpired && c.localCapBytes > host.localCapBytes { c.localCapBytes = host.localCapBytes }
+            let hostCap = ConfigRules.clampHostCap(host.localCapBytes)
+            if ttlExpired && c.localCapBytes > hostCap { c.localCapBytes = hostCap }
         }
         let fullDumpActive = c.fullDump && elapsed >= 0 && elapsed < Int64(c.fullDumpTtlS) * 1000
         return EffectiveConfig(config: c, fullDumpActive: fullDumpActive,

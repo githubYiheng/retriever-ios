@@ -70,9 +70,12 @@ enum Text {
     }
 
     /// user_id：≤ 128 B、不含 C0 / DEL / C1 控制字符（服务端校验规则；不合规的批会进隔离区，所以在源头清洗）。
+    /// 清洗后为空（`""`、纯空白、纯控制字符）= nil（ADR 0024 决定 10：否则所有用 `""` 表示未登录的设备在服务端归到同一个用户）。
+    /// 空白 = Unicode White_Space（`CharacterSet.whitespacesAndNewlines`）；非空白的值原样保留（不 trim）。
     static func sanitizeUserId(_ s: String?) -> String? {
         guard let s else { return nil }
         let cleaned = String(String.UnicodeScalarView(s.unicodeScalars.filter { !isControl($0) }))
+        if cleaned.unicodeScalars.allSatisfy({ CharacterSet.whitespacesAndNewlines.contains($0) }) { return nil }
         return truncate(cleaned, maxBytes: Limits.userIdBytes).0
     }
 

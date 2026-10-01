@@ -3,6 +3,49 @@
 本仓库（`githubYiheng/retriever-ios`）是 Retriever monorepo `sdk/ios` 的只读发布镜像（`git subtree split`）；
 改动一律回 monorepo。版本号遵循语义化版本：修订号 = 只修 bug；次版本 = 公开 API 只增；主版本 = 公开 API 有减或改。
 
+## [0.3.0] - 2026-10-01
+
+configure 之前没有实例（ADR 0023）、配置缓存只记远程明确给的值（ADR 0022）、宿主误用加固（ADR 0024）。公开 API 签名不变（无增减）；
+盘上只加可选键与新文件，0.2.x / 0.1.x 留下的状态全部照读（原地升级，不需要迁移；见下「升级」）；信封与线协议不变。
+
+### 默认行为变化（升级前请读）
+- **`configure` 之前不建实例**：此前任何 `Retriever.*` 调用都会用内置默认 Options 懒建实例，`configure` 之前的行按内置默认判定是否上传、
+  并可能按默认 20 MB 驱逐、按默认级别恢复旧会话。现在 `configure` 之前的行只追加到默认 root 下的 `pre/<uuid>.jsonl`（上限 1 MB），
+  `configure` 时按**本次** Options 判定、补过 `redact`、与之后的行同一个序号空间收编进会话；`configure` 之前不建会话、不联网、不驱逐、不恢复旧会话。
+  进程在 `configure` 之前死掉：这些行在之后某次启动 `configure` 时收编为独立会话再上传。
+- **`configure` 之前**：`installId` / `supportCode` 为 nil（此前是懒建实例的值）；`uploadLevel` / `localLevel` 读 warn / debug；
+  `flush()` 回 `.pending("paused")`；`purgeLocal()` 删 pre 文件并清空默认 root。
+- **`redact` 可能在 SDK 的后台线程上被调**（收编 configure 之前的行时）：须线程安全。`redact` 改 `ts` 不再生效（取回原值）。
+- **`processName` / `appGroup` 只认首次 `configure`**：之后改它们被忽略、留合成 warn `rtv.reconfigure_ignored`（此前会关掉旧实例另建新实例，
+  configure 之前的 `setUser`、排队中的 purge 留在旧实例上）。参数完全相同的再次 `configure` 只更新 `redact`，不再每次拉配置。
+- **宿主改 Options 立即生效**：配置缓存不再把服务端回显的宿主默认当远程覆盖（响应的 `from_host`），`configure` / 再次 `configure` 的级别在调用返回时就生效。
+- **fatal 节流**：距上一次 fatal 强制封段不足 10 s 的 fatal 不再各自封段 / 成批，并入 error 去抖。**flush 合并**：已有 flush 在等待且之后无新义务行时，
+  并发的 flush 共享同一结果、只追加一条标记行。
+- **`setUser("")` / 纯空白 = `setUser(nil)`**。
+- **禁用标记读不出 = 禁用**（fail-closed）。
+- **换 key / baseURL**：鉴权暂停与退避清掉、映射重发、配置缓存重拉；旧 key 的在途请求回 401 / 403 不暂停新 key。出站箱旧批照常用新 key 发。
+- `flush()` 等待中被 `setEnabled(false)`：回 `.pending("disabled")`（此前 `"paused"`）。
+
+### 新增
+- 合成 warn（`synthetic: true`，不经 `redact`）：`rtv.pre_init_dropped`（没写成的行的计数：pre 文件满 / 写不进、还没有会话）、
+  `rtv.root_vanished`（SDK 目录在运行中被删、已重新建会话）、`rtv.reconfigure_ignored`。
+
+### 修复
+- **没有会话时 `log()` 静默丢**（首次解锁前启动、启动时磁盘满、purge 重建失败）：改为计数并在有会话后上报。会话的 `meta.json` 写不成 = 建会话失败、稍后重试。
+- **物化时段文件读不出仍推进游标**（义务行静默丢）：读失败不推进、留待下次；段文件确已不存在才先记墓碑（`corrupt`）再推进。
+- **root 目录锁打不开时不加锁执行读改写**：改为本次失败、稍后重试。
+- **前后台初值靠猜**：非主线程建的会话一律记成前台，后台被回收后合成假崩溃。改为进程级 tracker（首次触达起记录，非主线程先记未知、主线程补读）。
+- **attrs 里的 `level` / `ctx` / `tag` / `synthetic` 键干扰判定**（批优先级、413 切分、恢复判重）：改按行内固定位置解析。
+- SDK 自己取消的请求（purge、后台到期）不再计入毒批失败次数。
+- SDK 的 `local_cap_bytes` 钳制缺省改为宿主值（对齐服务端权威实现）。
+
+### 升级（0.2.x / 0.1.x → 0.3.0）
+- 多数宿主无需改代码。把 `configure` 放在第一条日志之前仍是推荐写法；DI 构造期等早于 `configure` 的日志不再需要特别处理。
+- 盘上新增：`pre/` 目录、`meta.json` 的 `pre` 键、`config.json` 的 `key_fp` / `base_url` / `from_host`、`backoff.json` / `mapping.json` 的 `key_fp` / `base_url`。
+  旧文件缺这些键照读：指纹缺失视为与当前 key 相同并补写——升级本身不清退避 / 鉴权暂停、不重发映射、不丢配置缓存；install_id 不变，旧会话照常恢复、旧批照常上传。
+- 降级回 0.2.x：`pre/` 里没收编的行不被认识、留在盘上（升回来再收编）；新增的键被旧版忽略。
+- 依赖 `processName` / `appGroup` 在运行中切换的宿主（不推荐的用法）：首次 `configure` 就给出最终值。
+
 ## [0.2.0] - 2026-10-01
 
 遗留修复批（ADR 0019「本地状态自带真实归属」、ADR 0020「宿主线程不等待 SDK」）。公开 API 只增；盘上新增可选键与 root 同级文件，0.1.x 留下的状态全部照读（原地升级，不需要迁移）；信封字段不变。

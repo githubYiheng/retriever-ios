@@ -1,7 +1,8 @@
 import Foundation
 
 // 宿主 API（方案 §3.10，三端同名）。已发布的签名不改不减，只增（0.2.0 增：`isEnabled`、`purgeLocal(completion:)`、
-// `AttrValue.int(_:)`、`RetrieverLogger(subsystem:category:publicSystemLog:)`，ADR 0020）。
+// `AttrValue.int(_:)`、`RetrieverLogger(subsystem:category:publicSystemLog:)`，ADR 0020）。0.3.0 签名不变，
+// 语义见 ADR 0023 / 0024（configure 之前没有实例、实例身份在首次 configure 定死）。
 
 /// 日志级别；`Comparable` 按 debug < info < warn < error < fatal。
 public enum LogLevel: String, Sendable, Codable, CaseIterable, Comparable {
@@ -73,7 +74,7 @@ public struct LogLine: Sendable {
 /// SDK 版本号（唯一来源）：进 `device.sdk = "retriever-ios/<ver>"` 与 `X-Rtv-Sdk`。
 /// 发布门禁（`scripts/sdk-ios-release.sh`）要求它 == 发布版本号。
 public enum RetrieverVersion {
-    public static let current = "0.2.0"
+    public static let current = "0.3.0"
 }
 
 /// 宿主选项（§3.10；ADR 0004 / 0005）。
@@ -86,11 +87,13 @@ public struct Options: Sendable {
     public var dailyBatchCap: Int = 0
     /// 本地总量上限（宿主默认，远程可改，钳制 2–100 MB）。
     public var localCapBytes: Int = 20 * 1024 * 1024
-    /// 落盘前同步调用；返回 nil = 丢弃（不占 seq、不记墓碑）。钩子内调 `log()` 视为重入直接忽略。
+    /// 落盘前同步调用；返回 nil = 丢弃（不占 seq、不记墓碑）。钩子内调 `log()` 视为重入直接忽略；改 `ts` 无效（取回原值）。
+    /// configure 之前写的行在收编时（SDK 的后台线程上）补过钩子：须线程安全、要快。
     public var redact: (@Sendable (LogLine) -> LogLine?)? = nil
-    /// 会话目录 `proc-<name>`（§3.2）与信封 `process`。
+    /// 会话目录 `proc-<name>`（§3.2）与信封 `process`。只认首次 `configure`（之后改它被忽略并留合成 warn）。
     public var processName: String = "main"
     /// 可选：App Group 共享容器（扩展场景）。**暂不支持生产**：挂起时会持有组容器里的文件锁，可能被系统以 0xdead10cc 终止。
+    /// 只认首次 `configure`。
     public var appGroup: String? = nil
     /// 进 `device.sdk = "retriever-ios/<ver>"` 与 `X-Rtv-Sdk`。
     public var sdkVersion: String = RetrieverVersion.current
@@ -104,117 +107,70 @@ public enum FlushResult: Sendable, Equatable {
     case pending(String)
 }
 
-/// 静态入口：转发到进程内共享实例。`configure` 之前的 `log()` 也落盘（存储层不依赖 key）。
+/// 静态入口：转发到进程内共享入口。`configure` 之前的 `log()` 也落盘（追加到 pre 文件，configure 时按本次 Options 收编）。
 public enum Retriever {
+    /// 首次调用建实例并收编之前写的行；之后的调用改 key / baseURL / 级别 / redact 等（processName / appGroup 只认首次）。
+    /// 参数与上次完全相同时只更新 redact。
     public static func configure(key: String,
                                  baseURL: URL = URL(string: "https://logs.revdog.org")!,
                                  options: Options = Options()) {
         SharedClient.shared.configure(key: key, baseURL: baseURL, options: options)
     }
 
+    /// 清洗后为空（`""`、纯空白）= nil。
     public static func setUser(_ id: String?) {
-        SharedClient.shared.client().setUser(id)
+        SharedClient.shared.setUser(id)
     }
 
     public static func log(_ level: LogLevel, _ msg: String, tag: String? = nil,
                            attrs: [String: AttrValue]? = nil, error: (any Error)? = nil) {
-        SharedClient.shared.client().log(level, msg, tag: tag, attrs: attrs, error: error)
+        SharedClient.shared.log(level, msg, tag: tag, attrs: attrs, error: error)
     }
 
+    /// configure 之前 `.pending("paused")`。已有等待中的 flush 且之后没有新的义务行时合并到同一个等待。
     public static func flush(includeContext: Bool = true) async -> FlushResult {
-        await SharedClient.shared.client().flush(includeContext: includeContext)
+        await SharedClient.shared.flush(includeContext: includeContext)
     }
 
     /// 用户同意 / 撤回。`false`：不写不传、不拉配置，落盘为 root 同级的标记文件，跨重启有效（直到 `setEnabled(true)`）。
-    /// 在 `configure` 之前调用也生效（作为初值并落盘）。
+    /// 在 `configure` 之前调用也生效（立即落盘，并作为实例的初值）。
     public static func setEnabled(_ enabled: Bool) {
-        SharedClient.shared.client().setEnabled(enabled)
+        SharedClient.shared.setEnabled(enabled)
     }
 
-    /// 本进程当前是否启用（启动时从盘上的禁用标记初始化）。
+    /// 本进程当前是否启用：宿主显式值 ?? 盘上禁用标记（标记读不出按禁用）。
     public static var isEnabled: Bool {
-        SharedClient.shared.client().isEnabled
+        SharedClient.shared.isEnabled
     }
 
     /// 清空本地（新 install_id）。不阻塞调用线程：返回时清空尚未完成，需要新 `installId` 用 `purgeLocal(completion:)`。
-    /// `purgeLocal()` 返回到清空完成之间写的行会随旧状态一起删除。
+    /// `purgeLocal()` 返回到清空完成之间写的行会随旧状态一起删除。configure 之前调用：删 pre 文件并清空默认 root。
     public static func purgeLocal() {
-        SharedClient.shared.client().purgeLocal()
+        SharedClient.shared.purgeLocal()
     }
 
-    /// 同 `purgeLocal()`；清空与重建完成后在后台线程回调（此时 `installId` 已是新值）。
+    /// 同 `purgeLocal()`；清空与重建完成后在后台线程回调（此时 `installId` 已是新值；configure 之前为 nil）。
     public static func purgeLocal(completion: @escaping @Sendable () -> Void) {
-        SharedClient.shared.client().purgeLocal(completion: completion)
+        SharedClient.shared.purgeLocal(completion: completion)
     }
 
-    /// 生效的自动上传级别（远程配置钳制后；full_dump 期间为 debug）。未 configure 时 = Options 默认。
+    /// 生效的自动上传级别（远程配置钳制后；full_dump 期间为 debug）。未 configure 时 = warn。
     public static var uploadLevel: LogLevel {
-        SharedClient.shared.client().effectiveLevels.upload
+        SharedClient.shared.uploadLevel
     }
 
-    /// 生效的本地落盘级别（远程配置钳制后）。适配器用它早过滤。未 configure 时 = Options 默认。
+    /// 生效的本地落盘级别（远程配置钳制后）。适配器用它早过滤。未 configure 时 = debug（全收）。
     public static var localLevel: LogLevel {
-        SharedClient.shared.client().effectiveLevels.local
+        SharedClient.shared.localLevel
     }
 
+    /// 未 configure 时 nil。
     public static var installId: String? {
-        SharedClient.shared.client().installId
+        SharedClient.shared.installId
     }
 
-    /// install_id 前 8 位 + "-" + session_no。
+    /// install_id 前 8 位 + "-" + session_no。未 configure 时 nil。
     public static var supportCode: String? {
-        SharedClient.shared.client().supportCode
-    }
-}
-
-/// 进程内共享实例（惰性创建；configure 前用默认 root 与默认 options）。
-final class SharedClient: @unchecked Sendable {
-    /// 建实例：(root, key, baseURL, options, 带过来的宿主显式开关；nil = 按盘上标记)。
-    typealias Make = @Sendable (URL, String, URL, Options, Bool?) -> RetrieverClient
-
-    static let shared = SharedClient()
-
-    private let lock = NSLock()
-    private var instance: RetrieverClient?
-    private let rootFor: @Sendable (String?) -> URL
-    private let make: Make
-
-    /// 测试注入 root 与实例工厂；生产用默认值。
-    init(rootFor: @escaping @Sendable (String?) -> URL = { RetrieverClient.defaultRoot(appGroup: $0) },
-         make: @escaping Make = { root, key, baseURL, options, enabled in
-             RetrieverClient(root: root, key: key, baseURL: baseURL, options: options, clock: SystemClock(),
-                             transport: URLSessionTransport(), platform: SystemPlatform(), enabled: enabled)
-         }) {
-        self.rootFor = rootFor
-        self.make = make
-    }
-
-    func client() -> RetrieverClient {
-        lock.lock()
-        defer { lock.unlock() }
-        if let c = instance { return c }
-        let c = make(rootFor(nil), "", URL(string: "https://logs.revdog.org")!, Options(), nil)
-        instance = c
-        return c
-    }
-
-    func configure(key: String, baseURL: URL, options: Options) {
-        lock.lock()
-        defer { lock.unlock() }
-        let root = rootFor(options.appGroup)
-        var enabled: Bool?
-        if let c = instance {
-            if c.root.standardizedFileURL == root.standardizedFileURL
-                && c.processName == RetrieverClient.sanitizeProcessName(options.processName) {
-                c.reconfigure(key: key, baseURL: baseURL, options: options)
-                return
-            }
-            // root / 进程名变了（appGroup、processName 应在第一次 log 之前 configure）：
-            // 旧实例只投递封段收尾、不等待（锁内不做任何等待，ADR 0020 决定 1），新实例接管；
-            // 旧 root 里的会话由下次打开该 root 的实例恢复。宿主显式的 setEnabled（configure 之前的调用）带到新实例、落盘到新 root 旁。
-            c.shutdown()
-            enabled = c.explicitEnabled
-        }
-        instance = make(root, key, baseURL, options, enabled)
+        SharedClient.shared.supportCode
     }
 }

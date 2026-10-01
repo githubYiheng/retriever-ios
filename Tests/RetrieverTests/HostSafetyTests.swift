@@ -35,7 +35,7 @@ final class HostSafetyTests: XCTestCase {
         h.client.log(.warn, "to purge")
         await h.seal()
         XCTAssertEqual(h.outboxFiles().count, 1)
-        await h.work { $0.key = "lk_test_demo_abc_12345678" }
+        _ = await h.work { $0.setTarget(key: "lk_test_demo_abc_12345678", baseURL: $0.baseURL) }
         let release = await blockWork(h.client)
         h.client.kickDrain()                              // 排空排在清空前面
         let inCallback = Box<String>()
@@ -101,45 +101,41 @@ final class HostSafetyTests: XCTestCase {
         XCTAssertEqual(purgeSiblings(h.root), [], "改名出去的旧 root 已删")
     }
 
-    /// 换 root 的 configure：旧实例只投递收尾、不等待；共享锁内不等，另一个线程的 log() 不被挂住（修复前：持锁 work.sync）。
+    /// 第二次 configure 改 appGroup（ADR 0023 决定 5：实例身份只认首次）：不换实例、不等引擎（引擎被堵 3 s 也立即返回），
+    /// 另一个线程的 log() 不被挂住，行继续进原会话，留合成 warn `rtv.reconfigure_ignored`。
+    /// 0.2.0 的同名用例测的是「换 root → shutdown 旧实例 + 建新实例」不阻塞；该路径已删除，改为断言忽略且不阻塞。
     func testConfigureRootChangeDoesNotBlock() async throws {
-        let base = makeTempDir("rtv-shared")
-        let clock = FakeClock()
-        let shared = SharedClient(rootFor: { base.appendingPathComponent($0 ?? "default") },
-                                  make: { root, key, url, options, enabled in
-                                      RetrieverClient(root: root, key: key, baseURL: url, options: options, clock: clock,
-                                                      transport: FakeTransport(), platform: FakePlatform(), enabled: enabled)
-                                  })
-        let url = URL(string: "https://logs-test.invalid")!
-        shared.configure(key: "", baseURL: url, options: Options())
-        let old = shared.client()
-        await old.settle()
-        old.log(.warn, "old root")
-        let release = await blockWork(old)
-        var o = Options()
-        o.appGroup = "group.test"
+        let sh = SharedHarness()
+        sh.configure(key: "")
+        let c = sh.client
+        await c.settle()
+        c.log(.warn, "first root")
+        let release = await blockWork(c)
         let cfgMs = Box<Double>()
-        let opts = o
+        let shared = sh.shared
         DispatchQueue.global().async {
+            var o = Options()
+            o.appGroup = "group.test"
             let t0 = nowNs()
-            shared.configure(key: "", baseURL: url, options: opts)
+            shared.configure(key: "", baseURL: SharedHarness.url, options: o)
             cfgMs.set(elapsedMs(since: t0))
         }
         try? await Task.sleep(nanoseconds: 50_000_000)
         let t1 = nowNs()
-        shared.client().log(.warn, "meanwhile")
-        XCTAssertLessThan(elapsedMs(since: t1), 500, "别的线程的 log() 不被换 root 挂住")
+        sh.shared.log(.warn, "meanwhile")
+        XCTAssertLessThan(elapsedMs(since: t1), 500, "别的线程的 log() 不被挂住")
         await waitFor { cfgMs.value != nil }
-        XCTAssertLessThan(try XCTUnwrap(cfgMs.value), 500, "configure 不等旧实例的后台收尾")
-        let fresh = shared.client()
-        XCTAssertFalse(fresh === old)
-        XCTAssertEqual(fresh.root.path, base.appendingPathComponent("group.test").path)
+        XCTAssertLessThan(try XCTUnwrap(cfgMs.value), 500, "configure 不等引擎")
+        XCTAssertTrue(sh.client === c, "不换实例")
+        XCTAssertEqual(c.root.path, sh.defaultRoot.path)
         release()
-        await old.settle()
-        await fresh.settle()
-        // 旧实例的收尾在后台完成：段已封、义务行已物化
-        let oldOutbox = FS.list(base.appendingPathComponent("default/outbox")).filter { $0.hasSuffix(".gz") }
-        XCTAssertEqual(oldOutbox.count, 1)
+        await c.settle()
+        let ls = segmentLines(c.engine.current!.dir)
+        XCTAssertEqual(ls.compactMap { $0["msg"] as? String }.filter { ["first root", "meanwhile"].contains($0) }, ["first root", "meanwhile"])
+        let ign = ls.filter { $0["tag"] as? String == "rtv.reconfigure_ignored" }
+        XCTAssertEqual(ign.count, 1)
+        XCTAssertEqual((ign.first?["attrs"] as? [String: Any])?["field"] as? String, "app_group")
+        XCTAssertFalse(FS.exists(sh.base.appendingPathComponent("group.test")), "没在新 root 建任何东西")
     }
 
     // MARK: setEnabled 落盘（决定 2）
@@ -298,36 +294,32 @@ final class HostSafetyTests: XCTestCase {
         XCTAssertEqual(FS.list(root.appendingPathComponent("proc-main")), [h.client.writer.currentSessionId])
     }
 
-    /// configure 之前的禁用：懒建的默认实例落盘；换 root 时禁用状态带到新实例并落盘到新 root 旁，新实例不上传。
+    /// configure 之前的 setEnabled（ADR 0023：此时没有实例，文件级落盘）：false → 默认 root 旁的标记立即写成；configure 到
+    /// 另一个 root（appGroup）时显式值交给实例、落盘到新 root 旁，实例不写不传。反向：configure 之前显式 true → 删掉新 root 的旧标记。
+    /// 0.2.0 的同名用例测的是懒建实例换 root 时的交接；懒建实例已删除，改为测 configure 之前的文件级语义与交接。
     func testDisabledCarriedAcrossRootChange() async throws {
-        let base = makeTempDir("rtv-shared")
-        let clock = FakeClock()
-        let transport = FakeTransport()
-        let shared = SharedClient(rootFor: { base.appendingPathComponent($0 ?? "default") },
-                                  make: { root, key, url, options, enabled in
-                                      RetrieverClient(root: root, key: key, baseURL: url, options: options, clock: clock,
-                                                      transport: transport, platform: FakePlatform(), enabled: enabled)
-                                  })
-        shared.client().setEnabled(false)
-        await shared.client().settle()
-        XCTAssertTrue(FS.exists(disabledMarker(base.appendingPathComponent("default"))))
-        var o = Options()
-        o.appGroup = "group.test"
-        shared.configure(key: "lk_test_demo_abc_12345678", baseURL: URL(string: "https://logs-test.invalid")!, options: o)
-        let fresh = shared.client()
-        await fresh.settle()
-        XCTAssertFalse(fresh.isEnabled)
-        XCTAssertTrue(FS.exists(disabledMarker(base.appendingPathComponent("group.test"))))
-        XCTAssertEqual(transport.configRequests.count, 0)
-        XCTAssertEqual(transport.batchRequests.count, 0)
-        // 反向：新 root 旁有上次留下的标记，但宿主在 configure 之前显式 setEnabled(true) → 带过去、删新 root 的标记
-        fresh.setEnabled(true)
-        o.appGroup = "group.other"
-        try Data().write(to: disabledMarker(base.appendingPathComponent("group.other")))
-        shared.configure(key: "lk_test_demo_abc_12345678", baseURL: URL(string: "https://logs-test.invalid")!, options: o)
-        let other = shared.client()
-        await other.settle()
-        XCTAssertTrue(other.isEnabled)
-        XCTAssertFalse(FS.exists(disabledMarker(base.appendingPathComponent("group.other"))))
+        let sh = SharedHarness()
+        sh.shared.setEnabled(false)
+        XCTAssertFalse(sh.shared.isEnabled)
+        XCTAssertTrue(FS.exists(disabledMarker(sh.defaultRoot)), "configure 之前立即落盘")
+        sh.shared.log(.error, "not written")
+        XCTAssertEqual(sh.preFiles(), [], "禁用：零写入")
+        sh.configure { $0.appGroup = "group.test" }
+        let c = sh.client
+        await c.settle()
+        XCTAssertFalse(c.isEnabled)
+        XCTAssertTrue(FS.exists(disabledMarker(sh.base.appendingPathComponent("group.test"))))
+        XCTAssertEqual(sh.transport.configRequests.count, 0)
+        XCTAssertEqual(sh.transport.batchRequests.count, 0)
+
+        // 反向：新 root 旁有上次留下的标记，宿主在 configure 之前显式 setEnabled(true) → 交给实例、删新 root 的标记
+        let sh2 = SharedHarness()
+        try FileManager.default.createDirectory(at: sh2.base, withIntermediateDirectories: true)
+        try Data().write(to: disabledMarker(sh2.base.appendingPathComponent("group.other")))
+        sh2.shared.setEnabled(true)
+        sh2.configure { $0.appGroup = "group.other" }
+        await sh2.settle()
+        XCTAssertTrue(sh2.client.isEnabled)
+        XCTAssertFalse(FS.exists(disabledMarker(sh2.base.appendingPathComponent("group.other"))))
     }
 }

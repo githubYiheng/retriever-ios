@@ -27,6 +27,8 @@ struct InstallInfo: Equatable {
 /// meta.json：会话开始时原子写。
 /// `install_id`（可选键，ADR 0019 决定 6）：bootstrap 时的 install 身份冗余副本，install.json 损坏时据此修复；
 /// 0.1.x 写的 meta 没有这个键（照读，只是不当副本），旧 SDK 读新文件忽略它。
+/// `pre`（可选键，ADR 0023）：本会话正在收编的 pre 文件名（`<uuid>.jsonl`）；收编提交后清掉。恢复时它所指的文件仍在
+/// = 收编未提交，从 pre 文件重做；文件不在 = 已提交。旧 SDK 忽略它。
 struct SessionMeta: Equatable {
     var sessionId: String
     var sessionNo: Int64
@@ -34,6 +36,7 @@ struct SessionMeta: Equatable {
     var device: Device
     var process: String
     var installId: String?
+    var pre: String? = nil
 
     func encode() -> [UInt8] {
         var o = JSONOut()
@@ -43,6 +46,7 @@ struct SessionMeta: Equatable {
         o.raw(",\"device\":"); device.encode(into: &o)
         o.raw(",\"process\":"); o.string(process)
         if let i = installId { o.raw(",\"install_id\":"); o.string(i) }
+        if let p = pre { o.raw(",\"pre\":"); o.string(p) }
         o.raw("}")
         return o.bytes
     }
@@ -53,7 +57,8 @@ struct SessionMeta: Equatable {
               let dev = Device.decode(o["device"]) else { return nil }
         return SessionMeta(sessionId: sid, sessionNo: no, startedMs: JSONIn.int64(o["started_ms"]) ?? 0,
                            device: dev, process: (o["process"] as? String) ?? "main",
-                           installId: (o["install_id"] as? String).flatMap { IDs.isUuid($0) ? $0 : nil })
+                           installId: (o["install_id"] as? String).flatMap { IDs.isUuid($0) ? $0 : nil },
+                           pre: (o["pre"] as? String).flatMap { PreName.isValid($0) ? $0 : nil })
     }
 }
 
@@ -100,6 +105,10 @@ struct SegInfo {
     var obligCount: Int = 0
     var hasError: Bool = false
     var bytes: Int64 = 0
+    /// 级别 ≥ error 的行数、行 ts 的首末（只在写入侧统计；会话目录消失时据此计数，ADR 0024 决定 4）。
+    var errorLines: Int = 0
+    var firstTs: Int64 = 0
+    var lastTs: Int64 = 0
     var url: URL
 
     static func from(_ f: SegmentFile, url: URL) -> SegInfo {
@@ -231,24 +240,31 @@ enum JSONL {
     }
 }
 
-/// mapping.json：{user_id, device_digest, acked_ms}（上次被服务端确认的映射）
+/// mapping.json：{user_id, device_digest, acked_ms, key_fp, base_url}（上次被服务端确认的映射）。
+/// `key_fp` / `base_url`（ADR 0024 决定 7）：确认它的上传目标；有且与当前不符 = 未确认。两个键都没有（0.2.x / 0.1.x 写的旧文件）
+/// = 视为当前目标：照常沿用，并把当前指纹补写进去（升级不重发映射）。
 struct MappingState: Equatable {
     var userId: String?
     var deviceDigest: String
     var ackedMs: Int64
+    var keyFp: String? = nil
+    var baseURL: String? = nil
 
     func encode() -> [UInt8] {
         var o = JSONOut()
         o.raw("{\"user_id\":"); o.stringOrNull(userId)
         o.raw(",\"device_digest\":"); o.string(deviceDigest)
         o.raw(",\"acked_ms\":"); o.int(ackedMs)
+        o.raw(",\"key_fp\":"); o.stringOrNull(keyFp)
+        o.raw(",\"base_url\":"); o.stringOrNull(baseURL)
         o.raw("}")
         return o.bytes
     }
 
     static func decode(_ b: [UInt8]) -> MappingState? {
         guard let o = JSONIn.object(b), let d = o["device_digest"] as? String else { return nil }
-        return MappingState(userId: o["user_id"] as? String, deviceDigest: d, ackedMs: JSONIn.int64(o["acked_ms"]) ?? 0)
+        return MappingState(userId: o["user_id"] as? String, deviceDigest: d, ackedMs: JSONIn.int64(o["acked_ms"]) ?? 0,
+                            keyFp: o["key_fp"] as? String, baseURL: o["base_url"] as? String)
     }
 }
 
@@ -405,6 +421,8 @@ enum OutboxName {
 
 /// backoff.json：{attempt, next_at_wall_ms, next_at_mono_ms, paused_until_ms, paused_categories, reason}
 /// 另存 `last_ack_ms`（墓碑 last_ack_age_ms 需要跨启动的「上次 2xx」时刻；方案布局未列，见实现报告）。
+/// 另存 `key_fp` / `base_url`（ADR 0024 决定 7）：退避与鉴权暂停属于哪个上传目标；有且与当前不符时冷启动丢弃退避与暂停
+/// （`last_ack_ms` 保留）。两个键都没有（0.2.x / 0.1.x 写的旧文件）= 视为当前目标：照常沿用并补写指纹，不复位。
 struct BackoffState: Equatable {
     var attempt: Int = 0
     var nextAtWallMs: Int64 = 0
@@ -414,6 +432,8 @@ struct BackoffState: Equatable {
     var pausedCategories: [String] = []
     var reason: String = ""
     var lastAckMs: Int64 = -1
+    var keyFp: String? = nil
+    var baseURL: String? = nil
 
     func encode() -> [UInt8] {
         var o = JSONOut()
@@ -425,6 +445,8 @@ struct BackoffState: Equatable {
         for (i, c) in pausedCategories.enumerated() { if i > 0 { o.raw(",") }; o.string(c) }
         o.raw("],\"reason\":"); o.string(reason)
         o.raw(",\"last_ack_ms\":"); o.int(lastAckMs)
+        o.raw(",\"key_fp\":"); o.stringOrNull(keyFp)
+        o.raw(",\"base_url\":"); o.stringOrNull(baseURL)
         o.raw("}")
         return o.bytes
     }
@@ -439,6 +461,8 @@ struct BackoffState: Equatable {
         s.pausedCategories = (o["paused_categories"] as? [Any])?.compactMap { $0 as? String } ?? []
         s.reason = (o["reason"] as? String) ?? ""
         s.lastAckMs = JSONIn.int64(o["last_ack_ms"]) ?? -1
+        s.keyFp = o["key_fp"] as? String
+        s.baseURL = o["base_url"] as? String
         let nextWait = min(max(s.nextAtWallMs - nowWall, 0), Limits.backoffMaxMs)
         s.nextAtWallMs = nextWait > 0 ? nowWall + nextWait : 0
         s.nextAtMonoMs = nextWait > 0 ? nowMono + nextWait : 0

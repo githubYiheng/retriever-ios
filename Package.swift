@@ -44,7 +44,9 @@ let package = Package(
         ),
         .testTarget(
             name: "RetrieverTests",
-            dependencies: ["Retriever", "RetrieverKillHelper"]
+            dependencies: ["Retriever", "RetrieverKillHelper"],
+            // 两端共用的夹具（按 #filePath 读，不打包成资源）
+            exclude: ["Fixtures"]
         ),
         .testTarget(
             name: "RetrieverAdapterTests",

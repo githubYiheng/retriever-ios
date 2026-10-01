@@ -41,11 +41,32 @@ extension Engine {
         let from = s.cursor.extractedThroughOseq + 1
         var ob: [(OLine, String?)] = []
         if targetOseq >= from {
+            // 读失败 ≠ 没有内容（ADR 0024 决定 3）：任何一个相关段读不出（非 ENOENT）→ 本次不推进游标、不写批、留待下次；
+            // 段文件确已不存在 → 对它已知的义务区间先记墓碑（corrupt）、记成了才推进
+            var missing: [SegInfo] = []
             for info in s.sealed where info.obligCount > 0 && info.lastOseq >= from && info.firstOseq <= targetOseq {
-                guard let f = load(info) else { continue }
-                for l in f.lines where l.oseq >= from && l.oseq <= targetOseq {
-                    ob.append((OLine(seq: l.seq, oseq: l.oseq, ts: l.ts, rank: l.levelRank, raw: Array(f.data[l.range])), info.userId))
+                switch Segments.readStrict(info.url) {
+                case .failed:
+                    return
+                case .missing:
+                    missing.append(info)
+                case .ok(let f):
+                    cache[info.segNo] = f
+                    for l in f.lines where l.oseq >= from && l.oseq <= targetOseq {
+                        ob.append((OLine(seq: l.seq, oseq: l.oseq, ts: l.ts, rank: l.levelRank, raw: Array(f.data[l.range])), info.userId))
+                    }
                 }
+            }
+            if !missing.isEmpty {
+                let tombs = missing.map { info -> DropEntry in
+                    let f = max(info.firstOseq, from)
+                    let t = min(info.lastOseq, targetOseq)
+                    return DropEntry(sessionId: s.meta.sessionId, oseqFrom: f, oseqTo: t, n: t - f + 1,
+                                     reason: DropReason.corrupt.rawValue, atMs: now, lastAckAgeMs: lastAckAge(now))
+                }
+                guard appendDrops(tombs) else { return }
+                let gone = Set(missing.map(\.segNo))
+                s.sealed.removeAll { gone.contains($0.segNo) }
             }
             ob.sort { $0.0.oseq < $1.0.oseq }
         }
@@ -203,14 +224,14 @@ extension Engine {
     /// 取本批要带的 drops（≤ 100）与 closed_sessions（≤ 20）：按文件顺序取最旧的、未在途的条目（ADR 0019 决定 2）。
     /// 携带不改写文件、不合并、不计数；带不完的留给下一批。条目留在 jsonl 里直到携带它的批 2xx；在途的用内存集合排除。
     func takeExtras() -> ([DropEntry], [ClosedSession]) {
-        FS.withDirLock(root) {
+        FS.withDirLock(root) { () -> ([DropEntry], [ClosedSession]) in
             let drops = Array(readDropsLocked().lazy.filter { !self.embeddedDrops.contains($0) }.prefix(Limits.dropsPerBatch))
             embeddedDrops.formUnion(drops)
             let closed = Array(readClosedLocked().lazy.filter { !self.embeddedClosed.contains($0.sessionId) }
                 .prefix(Limits.closedSessionsPerBatch))
             embeddedClosed.formUnion(closed.map(\.sessionId))
             return (drops, closed)
-        }
+        } ?? ([], [])
     }
 
     func releaseExtras(_ e: ([DropEntry], [ClosedSession])) {
@@ -242,19 +263,16 @@ extension Engine {
         return meta
     }
 
-    static let levelWarn = Array("\"level\":\"warn\"".utf8)
-    static let levelError = Array("\"level\":\"error\"".utf8)
-    static let levelFatal = Array("\"level\":\"fatal\"".utf8)
-    static let ctxMark = Array(",\"ctx\":true".utf8)
-
+    /// 批元数据。级别取已解析的前缀，ctx 取行尾固定位置（ADR 0024 决定 9：attrs 里的 `level` / `ctx` 同名键不干扰
+    /// 优先级与 429 的 info 类别判定）。前缀解析不了的行保守按 warn（交给服务端隔离）。
     static func meta(name: String, header h: EnvelopeHeader, lines: [[UInt8]], bytes: Int64) -> BatchMeta {
         var warn = false
         var err = false
         for l in lines {
-            let s = l[...]
-            let e = Bytes.contains(levelError, in: s) || Bytes.contains(levelFatal, in: s)
-            if e || Bytes.contains(levelWarn, in: s) { warn = true }
-            if e && !Bytes.contains(ctxMark, in: s) { err = true }
+            let rank = Segments.parsePrefix(l, 0..<l.count)?.levelRank ?? LogLevel.warn.rank
+            let e = rank >= LogLevel.error.rank
+            if rank >= LogLevel.warn.rank { warn = true }
+            if e && !Segments.tail(l[...]).ctx { err = true }
         }
         let prio = OutboxName.parse(name)?.prio ?? 1
         return BatchMeta(name: name, prio: prio, createdMs: h.createdMs, batchId: h.batchId, kind: h.kind,

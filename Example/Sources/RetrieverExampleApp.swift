@@ -27,7 +27,9 @@ enum ExampleSetup {
     static func run() {
         let base = (Bundle.main.object(forInfoDictionaryKey: "RetrieverBaseURL") as? String).flatMap(URL.init(string:))
             ?? URL(string: "https://logs-staging.revdog.org")!
-        // 1. 第一条日志之前 configure（key 为空 = 只写本地不上传）
+        // 「configure 之前先 log」的两个场景（ADR 0023）：只有它们把 configure 往后推，其余场景照旧 configure 最先
+        ScenarioRunner.runBeforeConfigure()
+        // 1. 尽早 configure（key 为空 = 只写本地不上传）。configure 之前的行也不丢、按这次的 Options 判定，但仍建议放第一行
         Retriever.configure(key: key, baseURL: base, options: Options())
         // 2. swift-log：进程内只能 bootstrap 一次；已有 handler 用 MultiplexLogHandler
         LoggingSystem.bootstrap { label in RetrieverLogHandler(label: label) }
@@ -39,13 +41,39 @@ enum ExampleSetup {
     }
 }
 
-/// 真机验收用：`devicectl device process launch … com.loomalabs.retriever-example -- --scenario <name>`。
+/// 真机 / 模拟器验收用：`devicectl device process launch … com.loomalabs.retriever-example -- --scenario <name>`
+/// （模拟器：`xcrun simctl launch <udid> com.loomalabs.retriever-example --scenario <name>`）。
 /// 无 UI 自动化依赖；每个场景末尾记一条 warn（义务行）作为服务端可见的完成标记。
 enum ScenarioRunner {
-    static func runIfRequested() {
+    static var requested: String? {
         let args = ProcessInfo.processInfo.arguments
-        guard let i = args.firstIndex(of: "--scenario"), i + 1 < args.count else { return }
-        let name = args[i + 1]
+        guard let i = args.firstIndex(of: "--scenario"), i + 1 < args.count else { return nil }
+        return args[i + 1]
+    }
+
+    /// configure 之前跑的部分（只有 preconfigure / preconfigure_kill 有）：
+    /// - `preconfigure`：各级别 log 若干后返回，随后 configure；行在 configure 时按本次 Options 收编、过 redact；
+    /// - `preconfigure_kill`：log 若干后 configure 之前自杀（SIGKILL）——这次进程的行留在 pre 文件里，
+    ///   下次启动（任何场景）configure 之后作为独立会话上传（无 rtv.unclean_exit）。
+    static func runBeforeConfigure() {
+        switch requested {
+        case "preconfigure":
+            for i in 0..<3 { Retriever.log(.debug, "preconfigure debug \(i)", tag: "scenario") }
+            for i in 0..<3 { Retriever.log(.info, "preconfigure info \(i)", tag: "scenario") }
+            for i in 0..<2 { Retriever.log(.warn, "preconfigure warn \(i)", tag: "scenario") }
+            Retriever.log(.error, "preconfigure error", tag: "scenario", error: ScenarioError())
+        case "preconfigure_kill":
+            for i in 0..<5 { Retriever.log(.info, "preconfigure_kill info \(i)", tag: "scenario") }
+            Retriever.log(.warn, "preconfigure_kill about to die before configure", tag: "scenario")
+            kill(getpid(), SIGKILL)
+            while true { pause() }
+        default:
+            break
+        }
+    }
+
+    static func runIfRequested() {
+        guard let name = requested else { return }
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 1.0) { run(name) }
     }
 
@@ -71,6 +99,8 @@ enum ScenarioRunner {
                 let r = await Retriever.flush(includeContext: true)
                 Retriever.log(.warn, "flush result: \(r)", tag: "scenario")
             }
+        case "preconfigure":
+            break                                   // 已在 configure 之前跑完；末尾照常记完成标记
         case "crash":
             for i in 0..<200 { Retriever.log(.info, "pre-crash info \(i)", tag: "scenario") }
             Retriever.log(.warn, "about to crash", tag: "scenario")

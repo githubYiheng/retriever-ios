@@ -7,18 +7,21 @@ import Darwin
 /// 有义务行的旧会话终态写 sessions.jsonl；旧 session_id / user_id / device 一律取持久化值；
 /// cursor = max(cursor 文件, 出站箱里本会话最大 oseq_to)。段读不出的会话原样留到下次启动；零行的会话目录直接删。
 extension Engine {
-    static let uncleanTag = Array("\"tag\":\"rtv.unclean_exit\"".utf8)
+    static let uncleanTag = "rtv.unclean_exit"
 
-    func recoverOldSessions() {
-        guard let cur = current else { return }
+    /// 返回 false = 本次没恢复（拿不到 root 目录锁），调用方稍后重试；没有当前会话时无事可做，算完成。
+    @discardableResult
+    func recoverOldSessions() -> Bool {
+        guard let cur = current else { return true }
         let now = clock.wallMs()
         var outMax: [String: Int64] = [:]
         for m in metas.values where m.kind == .primary && !m.sessionId.isEmpty {
             outMax[m.sessionId] = max(outMax[m.sessionId] ?? 0, m.oseqTo)
         }
-        let (existingClosed, existingDrops): (Set<String>, [DropEntry]) = FS.withDirLock(root) {
+        // 拿不到 root 目录锁：本次不恢复，下次启动再来（ADR 0024 决定 3：不得不加锁执行）
+        guard let (existingClosed, existingDrops) = FS.withDirLock(root, { () -> (Set<String>, [DropEntry]) in
             (Set(readClosedLocked().map(\.sessionId)), readDropsLocked())
-        }
+        }) else { return false }
         var latest: SessionMeta?
 
         for sid in FS.list(procDir) where IDs.isUuid(sid) && sid != cur.meta.sessionId {
@@ -31,7 +34,8 @@ extension Engine {
             }
             if let m = recoverOne(sid: sid, dir: dir, now: now, outMax: outMax, existingClosed: existingClosed,
                                   existingDrops: existingDrops) {
-                if latest == nil || m.sessionNo > latest!.sessionNo { latest = m }
+                // 最近的旧会话按 started_ms 认（孤儿收编出的会话 session_no 在收编时才分配，ADR 0023）
+                if latest == nil || (m.startedMs, m.sessionNo) > (latest!.startedMs, latest!.sessionNo) { latest = m }
             }
             if lfd >= 0 {
                 flock(lfd, LOCK_UN)
@@ -39,6 +43,7 @@ extension Engine {
             }
         }
         previousAppVersion = latest?.device.appVersion
+        return true
     }
 
     /// 恢复一个旧会话；返回它的 meta（用于判断 app_version 变化）。
@@ -53,6 +58,9 @@ extension Engine {
             if segNames.isEmpty { FS.remove(dir) }
             return nil
         }
+        // 收编未提交（meta.pre 所指文件非空）或判不清（stat 出错）：不恢复、不物化，等重做 / 下一轮（ADR 0023；盲审裁决 8）。
+        // 确实不存在或长度为 0（截空提交）= 已提交
+        if let pre = meta.pre, preState(pre) != .committed { return nil }
         var cursor = FS.read(dir.appendingPathComponent("cursor.json")).flatMap(Cursor.decode) ?? Cursor()
         cursor.extractedThroughOseq = max(cursor.extractedThroughOseq, outMax[sid] ?? 0)
 
@@ -118,10 +126,11 @@ extension Engine {
             }
             exit = cursor.lastState == "fg" ? .uncleanFg : (cursor.lastState == "bg" ? .cleanBg : .unknown)
             let lastRaw: ArraySlice<UInt8>? = files.last.flatMap { f in f.lines.last.map { f.data[$0.range] } }
-            let alreadySynth = lastRaw.map { Bytes.contains(Engine.uncleanTag, in: $0) } ?? false
+            // 已合成过：按位置认（行尾 synthetic 标记 + msg 之后的 tag），attrs 里的同名键不算（ADR 0024 决定 9）
+            let alreadySynth = lastRaw.map { Segments.tail($0).synthetic && Segments.tag($0) == Engine.uncleanTag } ?? false
             // 合成行也是写入：只看本进程内存开关（禁用 = 不写，ADR 0020 决定 2）
             if exit == .uncleanFg && !alreadySynth && enabled {
-                let oblig = LogLevel.error.rank >= effective.uploadLevel.rank
+                let oblig = LogLevel.error.rank >= writer.levels.upload.rank
                 let seq = maxSeq + 1
                 let oseq: Int64 = oblig ? maxOseq + 1 : 0
                 let ts = max(maxTs, cursor.lastStateMs)

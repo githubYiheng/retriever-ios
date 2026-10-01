@@ -12,7 +12,7 @@ Swift 6 SPM 包，iOS 15+ / macOS 12+。规格：`docs/plan/system-design.md` §
 
 ```swift
 // Package.swift
-.package(url: "https://github.com/githubYiheng/retriever-ios.git", from: "0.2.0"),
+.package(url: "https://github.com/githubYiheng/retriever-ios.git", from: "0.3.0"),
 // target 依赖按需选：
 .product(name: "Retriever", package: "retriever-ios"),
 .product(name: "RetrieverSwiftLog", package: "retriever-ios"),         // 用 swift-log 时
@@ -28,7 +28,7 @@ Xcode：File → Add Package Dependencies… 填同一个 URL，Dependency Rule 
 ```swift
 import Retriever
 
-// application(_:didFinishLaunchingWithOptions:) 里、第一条日志之前
+// application(_:didFinishLaunchingWithOptions:) 里，越早越好（之前的日志也不丢，见下节）
 var o = Options(); o.uploadLevel = .warn          // 可选 .info / .debug（ADR 0004）
 Retriever.configure(key: "lk_live_<app>_…", options: o)
 Retriever.setUser(currentUserId)                    // 登录 / 登出时再调；nil = 未登录
@@ -37,36 +37,72 @@ Retriever.log(.error, "purchase failed", tag: "billing", attrs: ["code": .number
 
 - 「上报问题」：`let r = await Retriever.flush()`。它向当前段追加一条合成行（`error`、`tag: "rtv.flush"`、`synthetic: true`，
   无视上传级别一定上传），立即封段并排空；该批 15 s 内被服务端确认 → `.stored`，否则 `.pending("offline" | "backoff" | "paused" | "timeout")`
-  （`setEnabled(false)` 时 `.pending("disabled")`）。`flush(includeContext: false)` 时该批不带上下文。
+  （`setEnabled(false)` 时、或等待中被禁用，`.pending("disabled")`；`configure` 之前 `.pending("paused")`）。`flush(includeContext: false)` 时该批不带上下文。
+  已有一个 flush 在等待、且它之后没有新的义务行时，再调用会挂到同一个等待上（同一结果，不再追加标记行、不再换段）。**不要在 flush 的结果里自旋重试**。
 - 用户撤回同意：`Retriever.setEnabled(false)`——不写、不传、不拉配置，**落盘、跨重启有效**，直到 `setEnabled(true)`。
   状态记在 root 同级的空标记文件 `<root>.disabled`（清空本地不会带走它）；`configure` 之前调用也生效；`Retriever.isEnabled` 读当前值。
   标记写失败（磁盘满、首次解锁前）时本进程照样禁用、稍后重试；在写成之前进程就死的话下次启动是启用的——撤回同意的宿主请在每次启动、
   `configure` 之前再调一次 `setEnabled(false)`（幂等）。在途的那一个请求不取消（数据是同意期内采集的）。
-  不要把它当「临时暂停」用：重启不会恢复。
+  不要把它当「临时暂停」用：重启不会恢复。标记读不出（目录不可读等）按禁用处理（fail-closed），之后每次建会话成功、每次调度唤醒重判。
 - 清空本地：`Retriever.purgeLocal()`（新 install_id）。**不阻塞调用线程**：返回时清空尚未完成，`installId` 要在
-  `Retriever.purgeLocal { … }` 的完成回调（后台线程）里才是新值；返回到回调之间写的行随旧状态一起删除。撤回同意 = `setEnabled(false)` + `purgeLocal()`。
+  `Retriever.purgeLocal { … }` 的完成回调（后台线程）里才是新值；返回到回调之间写的行随旧状态一起删除。
+  **撤回同意的完整组合 = `setEnabled(false)` + `purgeLocal()` + `setUser(nil)`**（purge 不清用户）。`configure` 之前调用同样有效（删 pre 文件、清默认 root）。
+- `setUser`：清洗（剔除控制字符、截 128 B）后为空——`""`、纯空白——等同 `setUser(nil)`。
 - 客服短码：`Retriever.supportCode`。生效级别（远程配置钳制后）：`Retriever.uploadLevel` / `Retriever.localLevel`，适配器用来早过滤。
 - 整数 attrs（订单号、雪花 id 等）用 `.int(_:)`：`attrs: ["order": .int(Int64(orderId))]`。|v| ≤ 2^53 − 1 输出 JSON 数字，
   超出输出十进制字符串（Double 表示不了，否则会被静默改成别的数）。
 - `fatal`（含 `RetrieverLogger.fault`、swift-log `critical`）：行在返回前已落盘，封段与物化在后台进行，**不阻塞调用线程**；
-  进程随后死掉，下次启动会恢复并上报同一批。只能在 ObjC / Swift 异常处理路径里调，**不能在 signal handler 里调**（不是 async-signal-safe）。
+  进程随后死掉，下次启动会恢复并上报同一批。可以在任意线程调，**不能在 signal handler 里调**（不是 async-signal-safe）。
+  节流：距上一次 fatal 强制封段不足 10 s 的 fatal 照常逐行落盘，但不再强制封段，并入 error 的去抖封段（`.fault` 当普通严重级别用的代码不会每行一批）。
+
+## configure 之前的日志（0.3.0，ADR 0023）
+
+`configure` 之前 SDK **不建实例**：不建会话、不起后台线程、不联网、不驱逐、不恢复旧会话。这期间的 `log()`（含适配器）一次 `write(2)`
+追加到默认 root 下的 `pre/<uuid>.jsonl`（本进程一个文件，持 flock），**不丢、级别不过滤**；`configure` 时：
+
+- 按**本次** `configure` 的 Options（叠加远程明确下发的覆盖）判定这些行：低于 `localLevel` 的丢弃、达到 `uploadLevel` 的成为义务行（带 oseq），
+  与 configure 之后的行同一个序号空间、同一套封段规则（error 去抖、fatal 立即封段、用户边界）。行的 `ts` 保持写入时刻；
+- 这些行在收编时**补过 `redact`**——钩子此时在 SDK 的后台线程上被调：**必须线程安全、要快**；钩子里调 `log()` 被忽略；改 `ts` 无效；
+- 上限 1 MB（只管 configure 之前的行；configure 之后、收编完成之前的行照常落盘）：超出（以及磁盘满、首次解锁前写不进、
+  用户切换记录写不成之后）的行不缓存，只计数，之后以合成 warn `rtv.pre_init_dropped` 上报（attrs `count` /
+  `error_count` / `first_ts` / `last_ts`）。计数只在内存：进程在上报之前死掉则计数丢失（行本来就没写成）；
+- 期间的 `setUser` / `setEnabled` / `purgeLocal` 照常生效（文件级）；`flush` 回 `.pending("paused")`；`installId` / `supportCode` 为 nil；
+  `uploadLevel` / `localLevel` 读 warn / debug（适配器早过滤按全收）。禁用标记在、或宿主已 `setEnabled(false)` 时不写、不计数；
+- **从不 configure 的进程**（例如只打日志、不上传的扩展）：每个进程留一个 pre 文件。进程内第一次建 pre 文件之前，没有活进程持有的
+  旧 pre 文件总量超过 4 MB 或个数超过 8 个时，从最旧的删起（不计数）——本地占用有上限（R-5）。
+- **边界**：进程在 `configure` 之前就死（例如 DI 构造期崩溃循环），那次的行留在本地，等之后某次启动走到 `configure` 才收编成一个独立会话、上传
+  （没有前后台记录，不合成 `rtv.unclean_exit`）。SDK 在 `configure` 之前不知道 key，任何设计都传不出去——所以 **`configure` 仍然越早越好**，
+  只是不再影响判定的正确性。
+- `processName` / `appGroup` **只认首次 `configure`**：之后的 `configure` 改它们被忽略（其余参数照常生效），并留合成 warn `rtv.reconfigure_ignored`
+  （attrs `field` = `process_name` | `app_group`）。参数与上次完全相同的 `configure` 只更新 `redact`，不拉配置。
+- `configure` 指定 `appGroup` 时，本进程 configure 之前的行（在默认 root 的 pre 文件里）收编进 appGroup root 的会话；别的进程留下的孤儿 pre 文件由
+  使用默认 root 的实例收编。
 
 ## 宿主必须知道的纪律
 
 - **目录**：`Library/Application Support/<bundle-id>.retriever/`（`appGroup` 非空时为组容器里的 `<group>.retriever/`）。
   不要挪进 Caches / tmp，也不要自行清理；SDK 自己按容量（默认 20 MB，远程可调 2–100 MB）与 7 天驱逐。
 - **备份与保护类别**：SDK 对目录与每个文件设 `isExcludedFromBackup`，并显式设 `completeUntilFirstUserAuthentication`
-  （宿主把默认保护类设成 Complete 也不影响锁屏后台写入）。重启后首次解锁前写不进去的行只计数（`write_failed` 墓碑），不缓存——R-1 登记的例外。
+  （宿主把默认保护类设成 Complete 也不影响锁屏后台写入）。重启后首次解锁前写不进去的行只计数，不缓存——R-1 登记的例外：
+  有会话时义务行记 `write_failed` 墓碑；还没有会话（首次解锁前建不了）时计数，之后以合成 warn `rtv.pre_init_dropped` 上报。
+- **SDK 目录被删**：宿主在运行中删掉 SDK 目录（清缓存、退出登录清数据）时，SDK 在下一次换段 / 封段时发现，重新建会话（root 也没了则是新 install），
+  留合成 warn `rtv.root_vanished`，期间写不进去的行按 `rtv.pre_init_dropped` 计数上报。请不要这样做：那之前写的行会丢。
 - **`log()` 落盘即返回**：每行一次 `write(2)`，不经用户态缓冲；进程被杀 / 崩溃不丢。可从任意线程同步调用。
-  `redact` 钩子在落盘前同步执行，钩子里调 `log()` 会被忽略。
-- **扩展 / 多进程**：每个进程用不同的 `options.processName`（如 `"share-ext"`），并在第一条日志之前 `configure`
-  （`appGroup` / `processName` 决定目录，懒初始化后再改会切换到新目录；切换不阻塞，旧目录的收尾在后台完成）。出站箱共享，只有持有
+  `redact` 钩子在落盘前同步执行（configure 之前的行在收编时补过钩子，那时在 SDK 的后台线程上），钩子里调 `log()` 会被忽略，改 `ts` 无效。
+- **扩展 / 多进程**：每个进程用不同的 `options.processName`（如 `"share-ext"`），在首次 `configure` 里给出
+  （`appGroup` / `processName` 决定目录，只认首次 configure）。出站箱共享，只有持有
   `upload.lock` 的进程上传；活着的会话目录持有 flock，别的进程不会把它当孤儿恢复。
   - **`appGroup` 暂不支持生产**：SDK 在组容器里持有文件锁，app 挂起时仍持有，可能被系统以 `0xdead10cc` 终止。重构另立 ADR 前请不要在上线版本设 `appGroup`。
   - `setEnabled(false)` 的标记多进程共享：别的进程的上传与拉配置在下一次决策时就停，但它的写入要到它自己调用 `setEnabled(false)` 或重启才停。
   - `purgeLocal()` 只保证调用进程：其它进程内存里的 install 与已打开的文件不变，它们之后写出的批按各自信封里的 install 上报（不被服务端隔离）。
 - **gzip**：请求体是单成员标准 gzip（zlib windowBits 31），无尾随字节；文件字节即请求体，重试原样重发。
 - **网络**：SDK 用自己的 ephemeral `URLSession`，不经宿主的 session / 拦截器；服务端不回 3xx，SDK 也不跟随重定向。
+- **换 key**：`configure` 换了 key（或 baseURL）时，鉴权暂停与退避清掉、映射重发、配置缓存按过期处理并立即重拉；旧 key 发出的在途请求回 401 / 403
+  不会暂停新 key。出站箱里的旧批照常用新 key 发——**开发机在 staging / 生产之间切换前先 `purgeLocal()` 或卸载重装**，否则旧环境的日志会发到新环境。
+- **单元测试宿主**：XCTest 的宿主 app 会跑你的 `AppDelegate` / `App.init`，其中的 `configure` 会用真 key 把测试期间的日志传上去。
+  测试 target 里不要注入真 key（例如 key 只在非测试构建的 xcconfig 里给）。
+- **前后台**：SDK 首次被触达时起就在记前后台状态（非主线程首次触达时先记「未知」，随后在主线程补读），新会话的 `last_state` 取当时的状态——
+  不会把后台启动、后台里建的会话误记成前台（误记会在下次启动合成假的 `rtv.unclean_exit`）。
 
 ## os.Logger 项目怎么接
 
@@ -144,7 +180,21 @@ open RetrieverExample.xcodeproj  # 选真机运行（自动签名，team R22CUP2
 
 没有 `Retriever.local.xcconfig` 时 key 为空：只写本地不上传。baseURL 固定 `https://logs-staging.revdog.org`（staging 只收 `lk_test_` key）。
 界面显示 installId / supportCode / 出站箱待传数 / 生效级别；按钮演示 `Retriever.log`、swift-log、DDLog 三种写法，以及 flush、setUser、崩溃恢复、5000 行压测。
+启动参数 `--scenario <name>` 跑验收场景：`error`、`bulk`、`user`、`flush`、`crash`，以及 0.3.0 的 `preconfigure`（configure 之前各级别 log 若干、
+再 configure，末尾 warn `scenario preconfigure done`）与 `preconfigure_kill`（log 后在 configure 之前自杀；下次启动后作为独立会话上传）。
+只有这两个场景把 `configure` 往后推，其余场景照旧 configure 最先。
 命令行只编译不签名：`xcodebuild -project Example/RetrieverExample.xcodeproj -scheme RetrieverExample -destination 'generic/platform=iOS' build CODE_SIGNING_ALLOWED=NO`。
+
+## SDK 合成行（`synthetic: true`，不经 `redact`）
+
+| tag | 级别 | 何时 |
+|---|---|---|
+| `rtv.flush` | error | `flush()` 的标记行 |
+| `rtv.unclean_exit` | error | 恢复时：上次进程在前台结束、没收尾 |
+| `rtv.install_repaired` / `rtv.install_reset` | warn | install.json 损坏时修复 / 重建 |
+| `rtv.pre_init_dropped` | warn | 有没写成的行（pre 文件满 / 写不进、还没有会话）：attrs `count` / `error_count` / `first_ts` / `last_ts` |
+| `rtv.root_vanished` | warn | SDK 目录在运行中被删、已重新建会话 |
+| `rtv.reconfigure_ignored` | warn | 之后的 `configure` 改了 `processName` / `appGroup`（attrs `field`），已忽略 |
 
 ## 协议备注（与服务端 / 另两端对齐）
 
@@ -159,7 +209,12 @@ open RetrieverExample.xcodeproj  # 选真机运行（自动签名，team R22CUP2
   `backoff.json.last_ack_ms`（墓碑 `last_ack_age_ms` 跨启动）、`meta.json.install_id`（install 身份的冗余副本：install.json 损坏时据此修复、
   不换 id；0.1.x 的 meta 没有这个键，照读）；root 同级的 `<root>.disabled`（禁用标记）与 `<root>.purge-<uuid>`（清空时先改名再删，残留在启动时清掉）。
 - 远程配置请求头另带 `X-Rtv-Local-Cap-Bytes`（宿主 `localCapBytes`）。`setUser` 值变化即按新身份重拉配置；身份变化的那一刻缓存按过期处理
-  （放大型字段立即回落），请求发出后身份又变了的响应丢弃。
+  （放大型字段立即回落），请求发出后身份（install / user / 四项宿主默认 / key 指纹 / baseURL）又变了的响应丢弃并重拉。
+- 配置响应的 `from_host`（ADR 0022）：列出的宿主型字段取的是请求头里的宿主默认，SDK 缓存时记下它，生效时这些字段永远取**当前**宿主默认；
+  没有该键（旧服务端 / 0.2.x 的缓存）= 空集。宿主改 `uploadLevel` 等立即生效，不依赖缓存新旧。
+- 0.3.0 新增的本地状态：默认 root 下 `pre/<uuid>.jsonl`（configure 之前的行）；`meta.json` 可选键 `pre`（收编中，提交后清掉）；
+  `config.json` 加 `key_fp` / `base_url` / `from_host`，`backoff.json` / `mapping.json` 加 `key_fp` / `base_url`（key 指纹 = sha256(key) 前 16 位十六进制）。
+  旧版本写的文件没有这些键照读：指纹缺失视为与当前 key 相同并补写（升级不清退避、不重发映射、不丢配置缓存）。
 
 ## 开发
 

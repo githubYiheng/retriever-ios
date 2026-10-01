@@ -106,13 +106,16 @@ final class GoldenTests: XCTestCase {
     func testConfigClamp() throws {
         let g = try Repo.golden("config.json")
         let vs = try XCTUnwrap(g["clamp"] as? [[String: Any]])
-        XCTAssertEqual(vs.count, 50)
+        XCTAssertEqual(vs.count, 55)
+        XCTAssertEqual(vs.filter { ($0["host"] as? [String: Any])?["localCapBytes"] != nil }.count, 5, "带宿主 localCapBytes 的向量")
         for v in vs {
             let name = v["name"] as? String ?? ""
             let h = try XCTUnwrap(v["host"] as? [String: Any])
+            // host.localCapBytes 缺省 = 内置 20 MB（与 config.ts 一致）；给了就按宿主值作 local_cap_bytes 的回落（先钳到 2–100 MB）
             let host = HostDefaults(uploadLevel: LogLevel(rawValue: h["uploadLevel"] as? String ?? "") ?? .warn,
                                     localLevel: (h["localLevel"] as? String).flatMap(LogLevel.init(rawValue:)),
-                                    dailyBatchCap: JSONIn.int64(h["dailyBatchCap"]).map { Int($0) })
+                                    dailyBatchCap: JSONIn.int64(h["dailyBatchCap"]).map { Int($0) },
+                                    localCapBytes: JSONIn.int64(h["localCapBytes"]).map { Int($0) } ?? Limits.localCapBytesDefault)
             let raw: Any? = (v["raw"] is NSNull) ? nil : v["raw"]
             let c = ConfigRules.clamp(raw, host: host)
             let e = try XCTUnwrap(v["expect"] as? [String: Any])

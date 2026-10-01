@@ -98,7 +98,7 @@ final class LifecycleTests: XCTestCase {
             await h.seal()
         }
         h.client.log(.warn, "in open segment")
-        await h.work { $0.key = "lk_test_demo_abc_12345678" }
+        _ = await h.work { $0.setTarget(key: "lk_test_demo_abc_12345678", baseURL: $0.baseURL) }
         h.client.platformEvent(.didEnterBackground)
         let token = try XCTUnwrap(h.platform.begunTokens.first)
         await waitUntil { h.platform.endedTokens == [token] }

@@ -31,10 +31,26 @@ final class Engine: @unchecked Sendable {
     let platform: any PlatformHooks
     let writer: Writer
 
-    var host: HostDefaults
+    /// 宿主默认只存一份（在 writer 里，ADR 0022 / 简报 §2）。
+    var host: HostDefaults { writer.hostDefaults }
     var sdkVersion: String
-    var key: String
-    var baseURL: URL
+    private(set) var key: String
+    private(set) var baseURL: URL
+    /// 上传目标的 key 指纹（ADR 0024 决定 7）：backoff.json / mapping.json / 配置缓存身份各记一份。
+    private(set) var keyFp: String
+    /// configure 之前的 pre 文件所在目录（永远在默认 root 下，ADR 0023）。
+    let preDir: URL
+    /// 本实例用默认 root：孤儿 pre 文件由它收编、由它按 7 天驱逐、计入它的总量。
+    let adoptsOrphans: Bool
+    let counter: DropCounter
+    /// 本进程待收编的 pre 文件（configure 时交接过来；提交前会话不物化、不上传、不参与驱逐）。
+    var pendingAdoption: PendingAdoption?
+    /// 封段时发现段文件已被 unlink（会话目录 / root 在运行中消失，ADR 0024 决定 4）。
+    var vanishDetected = false
+    /// 旧会话恢复完成之前不驱逐（盲审 🔴1）：恢复之前旧会话不在 `others` 里，驱逐会无墓碑删掉它们的已封义务段。
+    var evictionAllowed = false
+    /// install.json 出过事、还没写进会话的合成行（bootstrap 在 meta 写不成等处失败重试时不能丢，盲审 🟡11）。
+    var pendingInstallNotes: [(tag: String, msg: String, attrs: [String: AttrValue]?)] = []
 
     var install: InstallInfo?
     var current: SessionRecord?
@@ -77,8 +93,8 @@ final class Engine: @unchecked Sendable {
     /// 放在 root 外面，清空 root 不可能顺手把它带走；多进程共享。
     let disabledMarkerURL: URL
 
-    init(root: URL, processName: String, key: String, baseURL: URL, options: Options,
-         clock: any Clock, platform: any PlatformHooks, writer: Writer) {
+    init(root: URL, processName: String, key: String, baseURL: URL, sdkVersion: String,
+         clock: any Clock, platform: any PlatformHooks, writer: Writer, preDir: URL, adoptsOrphans: Bool) {
         self.root = root
         self.procDir = root.appendingPathComponent("proc-\(processName)")
         self.outboxDir = root.appendingPathComponent("outbox")
@@ -87,15 +103,43 @@ final class Engine: @unchecked Sendable {
         self.clock = clock
         self.platform = platform
         self.writer = writer
+        self.counter = writer.counter
         self.key = key
         self.baseURL = baseURL
-        self.host = HostDefaults(options)
-        self.sdkVersion = options.sdkVersion
+        self.keyFp = ConfigRules.keyFingerprint(key)
+        self.sdkVersion = sdkVersion
+        self.preDir = preDir
+        self.adoptsOrphans = adoptsOrphans
+        device = Engine.deviceSnapshot(platform, sdkVersion: sdkVersion)
+        effective = writer.effective
+    }
+
+    static func deviceSnapshot(_ platform: any PlatformHooks, sdkVersion: String) -> Device {
         let f = platform.deviceFields()
-        device = Device(os: f["os"] ?? "", osVersion: f["os_version"] ?? "", model: f["model"] ?? "",
-                        appVersion: f["app_version"] ?? "", build: f["build"] ?? "", locale: f["locale"] ?? "",
-                        sdk: "retriever-ios/\(options.sdkVersion)").sanitized()
-        effective = ConfigCache.effective(nil, host: host, nowWall: clock.wallMs(), nowMono: clock.monoMs())
+        return Device(os: f["os"] ?? "", osVersion: f["os_version"] ?? "", model: f["model"] ?? "",
+                      appVersion: f["app_version"] ?? "", build: f["build"] ?? "", locale: f["locale"] ?? "",
+                      sdk: "retriever-ios/\(sdkVersion)").sanitized()
+    }
+
+    /// 换上传目标（configure / reconfigure）；返回 key 指纹或 baseURL 是否变了。
+    @discardableResult
+    func setTarget(key: String, baseURL: URL) -> Bool {
+        let fp = ConfigRules.keyFingerprint(key)
+        let changed = fp != keyFp || baseURL.absoluteString != self.baseURL.absoluteString
+        self.key = key
+        self.baseURL = baseURL
+        self.keyFp = fp
+        return changed
+    }
+
+    /// 上传目标变了（ADR 0024 决定 7）：清鉴权暂停与退避（last_ack 保留）、映射标为未确认、配置缓存按身份过期（调用方随后重拉）。
+    /// 出站箱里的旧批不动（照常用当前 key 发）。
+    func resetForNewTarget() {
+        backoff = BackoffState(lastAckMs: backoff.lastAckMs)
+        persistBackoff()
+        mapping = nil
+        pendingMapping = nil
+        if configCache != nil { configCache?.identityStale = true }
     }
 
     // MARK: 路径
@@ -119,8 +163,9 @@ final class Engine: @unchecked Sendable {
     /// 上传 / 拉配置的开关 = 本进程内存开关 ∧ 盘上没有禁用标记（每次决策 stat 一次；别的进程写的标记下一次决策就看到）。
     /// 内存开关读写入侧那一个（setEnabled 在调用线程上同步改它）：`enabled` 副本要等 work 队列轮到才对齐，
     /// 排在它前面的取批 / 拉配置不能按滞后的「启用」发出请求。
+    /// 标记判定未知（stat 出错）按禁用（fail-closed，ADR 0024 决定 6）。
     func uploadAllowed() -> Bool {
-        writer.isEnabled && !FS.exists(disabledMarkerURL)
+        writer.isEnabled && FS.markerState(disabledMarkerURL) == .absent
     }
 
     // MARK: 启动（同步：log() 在 init 返回后立即可用）
@@ -141,45 +186,72 @@ final class Engine: @unchecked Sendable {
     func bootstrap() -> Bool {
         guard FS.ensureDir(root), FS.ensureDir(procDir), FS.ensureDir(outboxDir) else { return false }
         FS.excludeFromBackup(root)
-        guard let outcome = FS.withDirLock(root, { bumpInstallLocked() }) else { return false }
+        guard let got = FS.withDirLock(root, { bumpInstallLocked() }), let outcome = got else { return false }
+        // install.json 出过事：先记下要留的合成行，本次 bootstrap 后面失败了重试时也照样写
+        if outcome.repaired {
+            pendingInstallNotes.append(("rtv.install_repaired", "install.json unreadable; identity repaired from session meta", nil))
+        }
+        if let d = outcome.discarded {
+            pendingInstallNotes.append(("rtv.install_reset", "install.json unreadable; local state discarded",
+                                        ["batches": .int(Int64(d.batches)), "sessions": .int(Int64(d.sessions))]))
+        }
         let inst = outcome.install
-        install = inst
         let now = clock.wallMs()
         let sid = IDs.newV4()
         let dir = procDir.appendingPathComponent(sid)
         guard FS.ensureDir(dir) else { return false }
         lockSessionDir(dir)
         let meta = SessionMeta(sessionId: sid, sessionNo: outcome.sessionNo, startedMs: now, device: device, process: processName,
-                               installId: inst.installId)
-        FS.writeAtomic(dir.appendingPathComponent("meta.json"), meta.encode())
+                               installId: inst.installId, pre: pendingAdoption?.name)
+        // meta.json 必须写成：不允许出现「有会话、没 meta」（ADR 0024 决定 2）——写不成 = 本次 bootstrap 失败、稍后重试
+        guard Engine.writeMeta(dir.appendingPathComponent("meta.json"), meta) else {
+            releaseSessionLock()
+            FS.remove(dir)
+            return false
+        }
+        install = inst
+        // 前后台初值取进程级 tracker（unknown → 不写，退出判 unknown；ADR 0023 决定 6）
         let cursor = Cursor(lastState: platform.isForeground().map { $0 ? "fg" : "bg" }, lastStateMs: now)
         let rec = SessionRecord(meta: meta, dir: dir, cursor: cursor, sealed: [])
         current = rec
         writeCursor(rec)
         writer.startSession(dir: dir, sessionId: sid)
         loadPersistentState()
-        // install.json 出过事：新会话里留一条合成行（同 rtv.flush 的合成机制），排障时看得见
-        if outcome.repaired {
-            appendSynthetic(now: now, tag: "rtv.install_repaired", msg: "install.json unreadable; identity repaired from session meta")
-        }
-        if let d = outcome.discarded {
-            appendSynthetic(now: now, tag: "rtv.install_reset", msg: "install.json unreadable; local state discarded",
-                            attrs: ["batches": .int(Int64(d.batches)), "sessions": .int(Int64(d.sessions))])
-        }
+        // install.json 出过事：新会话里留合成行（同 rtv.flush 的合成机制），排障时看得见
+        for n in pendingInstallNotes { appendSynthetic(now: now, tag: n.tag, msg: n.msg, attrs: n.attrs) }
+        pendingInstallNotes = []
         return true
     }
 
-    private func appendSynthetic(now: Int64, tag: String, msg: String, attrs: [String: AttrValue]? = nil) {
+    /// SDK 合成 warn（不经 redact，同 rtv.flush 的合成机制）。返回是否落盘（收编中 = 已进 pre 文件）。
+    @discardableResult
+    func appendSynthetic(now: Int64, tag: String, msg: String, attrs: [String: AttrValue]? = nil) -> Bool {
         let enc = LineEncoder.encode(LogLine(ts: now, level: .warn, msg: msg, tag: tag, attrs: attrs), synthetic: true)
-        _ = writer.append(level: .warn, body: enc.body)
+        return writer.append(level: .warn, ts: now, body: enc.body).written
+    }
+
+    /// 计数器非零且有可写会话：写合成 warn `rtv.pre_init_dropped`（attrs count / error_count / first_ts / last_ts）并清零
+    /// （ADR 0024 决定 1）。没写成放回；被 local_level 过滤 = 宿主不要 warn 行，按已上报清掉。禁用时不写、留着。
+    /// 强制写入、强制义务（同 flush 标记，不受宿主 local_level / upload_level 影响：被过滤掉就等于静默）；收编中不写（提交后写）。
+    func reportDropped() {
+        guard writer.isEnabled, writer.hasSession, !writer.isAdopting, let snap = counter.take() else { return }
+        let now = clock.wallMs()
+        let enc = LineEncoder.encode(DropCounter.line(snap, ts: now), synthetic: true)
+        let out = writer.appendForced(level: .warn, ts: now, body: enc.body)
+        if !out.written { counter.putBack(snap) }
+    }
+
+    /// meta.json 原子写（测试可按路径注入失败）。
+    static func writeMeta(_ url: URL, _ meta: SessionMeta) -> Bool {
+        if Faults.failsMetaWrite(url) { return false }
+        return FS.writeAtomic(url, meta.encode())
     }
 
     /// 清空（ADR 0019 决定 9）的第一步：把整个 root 改名为同级的 `<root>.purge-<uuid>`（一步原子：新旧状态不可能混用），
     /// 之后的递归删除只碰改过名的目录。改名后、删完前被杀：root 已不存在，下次 bootstrap 建新 root，残留由 `removePurgeLeftovers` 清掉。
     /// 返回改名后的目录；改名失败返回 nil（root 原样还在）。
     func moveRootAside() -> URL? {
-        let dst = Engine.sibling(of: root, suffix: ".purge-" + IDs.newV4())
-        return rename(root.path, dst.path) == 0 ? dst : nil
+        FS.moveAside(root).moved
     }
 
     /// 启动时清掉清空中途被杀留下的 `<root>.purge-*`（work 队列上，不占宿主线程）。
@@ -314,15 +386,65 @@ final class Engine: @unchecked Sendable {
     private func loadPersistentState() {
         let nowWall = clock.wallMs()
         let nowMono = clock.monoMs()
+        let base = baseURL.absoluteString
+        // 上传目标的指纹（ADR 0024 决定 7）：文件里有且与当前不符 → 复位；**没有**（0.2.x / 0.1.x 写的旧文件）→ 视为与当前相同、
+        // 照常沿用，并把当前指纹补写进去（升级本身不清退避、不重发映射、不丢配置缓存）
         if let b = FS.read(backoffURL), let s = BackoffState.decodeColdStart(b, nowWall: nowWall, nowMono: nowMono) {
-            backoff = s
+            if s.keyFp == nil && s.baseURL == nil {
+                backoff = s
+                persistBackoff()
+            } else {
+                backoff = (s.keyFp == keyFp && s.baseURL == base) ? s : BackoffState(lastAckMs: s.lastAckMs)
+            }
         }
-        if let b = FS.read(mappingURL) { mapping = MappingState.decode(b) }
+        if let b = FS.read(mappingURL), var m = MappingState.decode(b) {
+            if m.keyFp == nil && m.baseURL == nil {
+                m.keyFp = keyFp
+                m.baseURL = base
+                FS.writeAtomic(mappingURL, m.encode())
+                mapping = m
+            } else if m.keyFp == keyFp && m.baseURL == base {
+                mapping = m
+            }
+        }
         if let b = FS.read(configURL), let o = JSONIn.object(b), let fetched = JSONIn.int64(o["fetched_ms"]) {
-            configCache = ConfigCache(config: ConfigRules.clamp(o["config"], host: host), fetchedWallMs: fetched, fetchedMonoMs: nil)
+            var c = ConfigCache(config: ConfigRules.clamp(o["config"], host: host), fetchedWallMs: fetched, fetchedMonoMs: nil,
+                                fromHost: ConfigRules.parseFromHost(o["from_host"]))
+            // 缓存是为谁拉的（盲审 🟠4）：没有该键（旧文件）= null。与本实例的初始用户（configure 之前的 setUser）不一致 →
+            // 按身份过期（放大型字段回落），startup 立即按新身份重拉
+            c.userId = o["user_id"] as? String
+            if c.userId != writer.currentUser { c.identityStale = true }
+            let fileFp = o["key_fp"] as? String
+            let fileBase = o["base_url"] as? String
+            if fileFp == nil && fileBase == nil {
+                configCache = c
+                persistConfigCache()
+            } else {
+                // 缓存属于别的上传目标：按身份过期（放大型字段回落），startup 立即重拉
+                if fileFp != keyFp || fileBase != base { c.identityStale = true }
+                configCache = c
+            }
         }
-        effective = ConfigCache.effective(configCache, host: host, nowWall: nowWall, nowMono: nowMono)
-        writer.setLevels(upload: effective.uploadLevel, local: effective.config.localLevel, flushIntervalS: effective.config.flushIntervalS)
+        effective = writer.setConfigCache(configCache)
+    }
+
+    /// config.json：{fetched_ms, key_fp, base_url, user_id, config{12 字段}, from_host[]}（ADR 0022 / 0024 决定 7；user_id = 这份
+    /// 配置所属请求身份的用户，可为 null）。
+    func persistConfigCache() {
+        guard let c = configCache else { return }
+        var file = JSONOut()
+        file.raw("{\"fetched_ms\":"); file.int(c.fetchedWallMs)
+        file.raw(",\"key_fp\":"); file.string(keyFp)
+        file.raw(",\"base_url\":"); file.string(baseURL.absoluteString)
+        file.raw(",\"user_id\":"); file.stringOrNull(c.userId)
+        file.raw(",\"config\":"); file.raw(ConfigRules.encode(c.config))
+        file.raw(",\"from_host\":[")
+        for (i, f) in ConfigRules.hostFields.filter({ c.fromHost.contains($0) }).enumerated() {
+            if i > 0 { file.raw(",") }
+            file.string(f)
+        }
+        file.raw("]}")
+        FS.writeAtomic(configURL, file.bytes)
     }
 
     // MARK: 状态文件
@@ -332,6 +454,8 @@ final class Engine: @unchecked Sendable {
     }
 
     func persistBackoff() {
+        backoff.keyFp = keyFp
+        backoff.baseURL = baseURL.absoluteString
         FS.writeAtomic(backoffURL, backoff.encode())
     }
 
@@ -347,9 +471,23 @@ final class Engine: @unchecked Sendable {
     /// 处理写入侧交来的全部封段任务；返回是否有新批次产生。
     @discardableResult
     func processSeals() -> Bool {
+        // 收编提交之前会话不物化（ADR 0023）：封段任务留在写入侧，提交后一并处理
+        guard pendingAdoption == nil else { return false }
+        if writer.hasVanished { vanishDetected = true }
+        guard !vanishDetected else { return false }
         let jobs = writer.takePendingSeals()
         guard !jobs.isEmpty, let cur = current else {
             flushTombstones()
+            return false
+        }
+        // 段文件已被 unlink（会话目录 / root 在运行中被删）：交回调用方重新 bootstrap，这些段里的行计数
+        if jobs.contains(where: { j in var st = stat(); return fstat(j.fd, &st) == 0 && st.st_nlink == 0 }) {
+            for j in jobs {
+                var st = stat()
+                if fstat(j.fd, &st) == 0 && st.st_nlink == 0 { counter.add(segment: j.info) }
+                close(j.fd)
+            }
+            vanishDetected = true
             return false
         }
         for j in jobs {
@@ -383,6 +521,8 @@ final class Engine: @unchecked Sendable {
 
     /// 写入侧的 write_failed 墓碑：可写时落盘。
     func flushTombstones() {
+        // 收编提交之前不落会话的墓碑：重做会从 oseq 1 重新编号，提交前的墓碑区间可能不再对应（提交后一并落）
+        guard pendingAdoption == nil else { return }
         let failed = writer.takeFailed()
         guard !failed.isEmpty, let cur = current else { return }
         let entries = failed.map {
@@ -396,7 +536,7 @@ final class Engine: @unchecked Sendable {
     @discardableResult
     func appendDrops(_ entries: [DropEntry]) -> Bool {
         guard !entries.isEmpty else { return true }
-        return FS.withDirLock(root) {
+        return FS.withDirLock(root) { () -> Bool in
             guard FS.append(dropsURL, JSONL.encodeDrops(entries)) else { return false }
             let all = readDropsLocked()
             if all.count > ClientConstants.dropsFileMaxEntries {
@@ -405,13 +545,13 @@ final class Engine: @unchecked Sendable {
                     Engine.dropOldest(merged, over: ClientConstants.dropsFileMaxEntries) { embeddedDrops.contains($0) }))
             }
             return true
-        }
+        } ?? false
     }
 
     /// 追加一条会话终态；文件超过上限删最旧的未在途条目（这些会话在服务端归 unknown，不误报）。
     @discardableResult
     func appendClosed(_ c: ClosedSession) -> Bool {
-        FS.withDirLock(root) {
+        FS.withDirLock(root) { () -> Bool in
             guard FS.append(sessionsURL, JSONL.encodeClosed([c])) else { return false }
             let all = readClosedLocked()
             if all.count > ClientConstants.sessionsFileMaxEntries {
@@ -419,7 +559,7 @@ final class Engine: @unchecked Sendable {
                     Engine.dropOldest(all, over: ClientConstants.sessionsFileMaxEntries) { embeddedClosed.contains($0.sessionId) }))
             }
             return true
-        }
+        } ?? false
     }
 
     func readDropsLocked() -> [DropEntry] {
@@ -538,7 +678,8 @@ final class Engine: @unchecked Sendable {
     var ownSessions: [SessionRecord] {
         var out: [SessionRecord] = []
         if let c = current { out.append(c) }
-        out.append(contentsOf: others.values.sorted { $0.meta.sessionNo < $1.meta.sessionNo })
+        // 按 started_ms 排（孤儿 pre 文件收编出的会话 session_no 在收编时才分配，ADR 0023）
+        out.append(contentsOf: others.values.sorted { ($0.meta.startedMs, $0.meta.sessionNo) < ($1.meta.startedMs, $1.meta.sessionNo) })
         return out
     }
 }

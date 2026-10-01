@@ -75,6 +75,17 @@ enum ClientConstants {
     static let requestTimeoutS: Double = 30
     /// 调度器地板：任何候选已到期时也至少等 1 s，杜绝 0 ms 自旋（发版前审查 H2）。
     static let schedulerMinDelayMs: Int64 = 1000
+    /// configure 之前的 pre 文件上限（ADR 0023；含头记录）：追加后会超过它的记录不写、计数（之后整个文件不再写）。
+    static let preFileMaxBytes: Int64 = 1024 * 1024
+    /// 从不 configure 的宿主：进程内首次建 pre 文件之前，没有活持有者的旧 pre 文件总量 / 个数超过它们时从 mtime 最旧的删起（R-5）。
+    static let preDirMaxBytes: Int64 = 4 * 1024 * 1024
+    static let preDirMaxFiles = 8
+    /// 不属于活进程且 mtime 超过它的 pre 文件在驱逐时删除（R-5）。
+    static let preOrphanMaxAgeMs: Int64 = 7 * 24 * 60 * 60 * 1000
+    /// fatal 节流窗口（ADR 0024 决定 8）：距上一次 fatal 强制换段不足它的 fatal 行不强制换段、并入 error 去抖。
+    static let fatalWindowMs: Int64 = 10_000
+    /// 收编 / 重新 bootstrap 未完成时的重试间隔。
+    static let adoptionRetryMs: Int64 = 5_000
     /// §3.1 stack 超长时中间插入的标记。
     static let stackMarker = "\n…[truncated]…\n"
     static let dayMs: Int64 = 24 * 60 * 60 * 1000

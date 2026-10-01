@@ -87,6 +87,9 @@ final class FakeTransport: Transport, @unchecked Sendable {
     var configHang = false
     /// 配置请求挂起直到 releaseHeldConfigs()，届时按请求时刻的 configBody 回 200（身份切换竞态）。
     var configHold = false
+    /// 回显模式（与 ingest 一致，ADR 0022）：configBody 当作合并后的远程文档，没有有效值的四个宿主型字段按请求头补齐，
+    /// 并给出 `from_host`。
+    var configEcho = false
     private(set) var requests: [HTTPRequest] = []
     private(set) var cancelCount = 0
     private var hanging: [CheckedContinuation<HTTPResponse?, Never>] = []
@@ -122,7 +125,8 @@ final class FakeTransport: Transport, @unchecked Sendable {
         lock.withLock {
             requests.append(request)
             if request.url.path.hasSuffix("/v1/config") {
-                return (configHold ? .heldConfig : (configHang ? .hang : nil), configBody, configEtag, nil)
+                let body = configEcho ? FakeTransport.echo(configBody ?? [:], request.headers) : configBody
+                return (configHold ? .heldConfig : (configHang ? .hang : nil), body, configEtag, nil)
             }
             let bid = FakeTransport.batchId(request.body)
             var reply: Reply
@@ -172,6 +176,23 @@ final class FakeTransport: Transport, @unchecked Sendable {
     }
 
     private func json(_ o: [String: Any]) -> Data { try! JSONSerialization.data(withJSONObject: o) }
+
+    /// ingest 的回显：宿主型字段没有有效值时取请求头里的宿主默认（`hostDefaults` + `mergeConfigWithProvenance`）。
+    static func echo(_ raw: [String: Any], _ h: [String: String]) -> [String: Any] {
+        var out = raw
+        let derived = ConfigRules.hostDerivedFields(raw)
+        for f in derived {
+            switch f {
+            case "upload_level": out[f] = h["X-Rtv-Upload-Level"] ?? "warn"
+            case "local_level": out[f] = h["X-Rtv-Local-Level"] ?? "debug"
+            case "local_cap_bytes": out[f] = Int(h["X-Rtv-Local-Cap-Bytes"] ?? "") ?? Limits.localCapBytesDefault
+            case "daily_batch_cap": out[f] = Int(h["X-Rtv-Daily-Batch-Cap"] ?? "") ?? 0
+            default: break
+            }
+        }
+        out["from_host"] = derived
+        return out
+    }
 
     static func batchId(_ body: Data?) -> String? {
         guard let body, let env = decodeEnvelope(body) else { return nil }
@@ -401,4 +422,87 @@ func runValidatorFiles(_ paths: [String]) throws -> [[String: Any]] {
         XCTFail("validator output mismatch: \(text) \(String(decoding: errData, as: UTF8.self))")
     }
     return results
+}
+
+// MARK: 共享入口夹具（静态 `Retriever.*` 的实现，ADR 0023）
+
+/// 走共享入口（`SharedClient`）：configure 之前没有实例，只有 pre 文件。root = base/<appGroup ?? "default">。
+final class SharedHarness {
+    let base: URL
+    let clock: FakeClock
+    let transport: FakeTransport
+    let platform: FakePlatform
+    let shared: SharedClient
+    static let key = "lk_test_demo_abc_12345678"
+    static let url = URL(string: "https://logs-test.invalid")!
+
+    init(base: URL? = nil, clock: FakeClock = FakeClock(), transport: FakeTransport = FakeTransport(),
+         platform: FakePlatform = FakePlatform()) {
+        let b = base ?? makeTempDir("rtv-shared")
+        self.base = b
+        self.clock = clock
+        self.transport = transport
+        self.platform = platform
+        let t = transport
+        shared = SharedClient(rootFor: { b.appendingPathComponent($0 ?? "default") }, clock: clock, platform: platform,
+                              transport: { t })
+    }
+
+    var defaultRoot: URL { base.appendingPathComponent("default") }
+    var preDir: URL { defaultRoot.appendingPathComponent("pre") }
+    var client: RetrieverClient { shared.instanceForTesting! }
+
+    func configure(key: String = SharedHarness.key, _ edit: (inout Options) -> Void = { _ in }) {
+        var o = Options()
+        edit(&o)
+        shared.configure(key: key, baseURL: SharedHarness.url, options: o)
+    }
+
+    func settle() async { if let c = shared.instanceForTesting { await c.settle() } }
+
+    func preFiles() -> [String] { FS.list(preDir).filter { $0.hasSuffix(".jsonl") }.sorted() }
+
+    /// 某个 root 下某进程目录里全部会话（按 session_no）。
+    func sessions(_ root: URL? = nil, process: String = "main") -> [(sid: String, meta: [String: Any])] {
+        let p = (root ?? defaultRoot).appendingPathComponent("proc-\(process)")
+        return FS.list(p).filter(IDs.isUuid).compactMap { sid -> (String, [String: Any])? in
+            guard let d = try? Data(contentsOf: p.appendingPathComponent(sid).appendingPathComponent("meta.json")),
+                  let m = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] else { return nil }
+            return (sid, m)
+        }.sorted { int($0.1["session_no"]) < int($1.1["session_no"]) }
+    }
+
+    func outboxFiles(_ root: URL? = nil) -> [String] {
+        FS.list((root ?? defaultRoot).appendingPathComponent("outbox")).filter { $0.hasSuffix(".gz") }.sorted()
+    }
+
+    func envelopes(_ root: URL? = nil) -> [[String: Any]] {
+        let o = (root ?? defaultRoot).appendingPathComponent("outbox")
+        return outboxFiles(root).compactMap { n in (try? Data(contentsOf: o.appendingPathComponent(n))).flatMap(decodeEnvelope) }
+    }
+}
+
+/// 会话目录里全部段的行（不含段头），按段号、行序。
+func segmentLines(_ dir: URL) -> [[String: Any]] {
+    FS.list(dir).compactMap { n -> (Int, String)? in Segments.parseName(n).map { ($0.0, n) } }.sorted { $0.0 < $1.0 }
+        .flatMap { (_, n) -> [[String: Any]] in
+            guard let s = try? String(contentsOf: dir.appendingPathComponent(n), encoding: .utf8) else { return [] }
+            return s.split(separator: "\n").dropFirst()
+                .compactMap { (try? JSONSerialization.jsonObject(with: Data($0.utf8))) as? [String: Any] }
+        }
+}
+
+/// 会话目录里各段的段头。
+func segmentHeaders(_ dir: URL) -> [[String: Any]] {
+    FS.list(dir).compactMap { n -> (Int, String)? in Segments.parseName(n).map { ($0.0, n) } }.sorted { $0.0 < $1.0 }
+        .compactMap { (_, n) -> [String: Any]? in
+            guard let s = try? String(contentsOf: dir.appendingPathComponent(n), encoding: .utf8),
+                  let first = s.split(separator: "\n").first else { return nil }
+            return (try? JSONSerialization.jsonObject(with: Data(first.utf8))) as? [String: Any]
+        }
+}
+
+/// pre 文件的原始记录行。
+func preRecords(_ url: URL) -> [String] {
+    ((try? String(contentsOf: url, encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
 }

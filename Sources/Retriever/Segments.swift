@@ -63,7 +63,29 @@ enum Segments {
 
     /// 读段文件。`validate` = 逐行 JSON 校验（恢复孤儿段时用；平时只解析前缀）。
     static func read(_ url: URL, validate: Bool) -> SegmentFile? {
-        guard let data = FS.read(url), let (segNo, _) = parseName(url.lastPathComponent) else { return nil }
+        guard let data = FS.read(url) else { return nil }
+        return parse(url, data, validate: validate)
+    }
+
+    /// 严格读（物化用，ADR 0024 决定 3）：读失败（含读不全）与「文件确已不存在」分开。
+    enum StrictRead {
+        case ok(SegmentFile)
+        case missing
+        case failed
+    }
+
+    static func readStrict(_ url: URL) -> StrictRead {
+        switch FS.readStrict(url) {
+        case .missing: return .missing
+        case .failed: return .failed
+        case .ok(let data):
+            guard let f = parse(url, data, validate: false) else { return .failed }
+            return .ok(f)
+        }
+    }
+
+    static func parse(_ url: URL, _ data: [UInt8], validate: Bool) -> SegmentFile? {
+        guard let (segNo, _) = parseName(url.lastPathComponent) else { return nil }
         var seg = SegmentFile(url: url, segNo: segNo, header: nil, data: data, lines: [], validEnd: 0, corruptChunks: 0)
         var start = 0
         var first = true
@@ -114,7 +136,14 @@ enum Segments {
         return SegmentHeader(segNo: Int(segNo), userId: user, startedMs: JSONIn.int64(o["started_ms"]) ?? 0)
     }
 
-    struct Prefix { var seq: Int64; var oseq: Int64; var ts: Int64; var levelRank: Int }
+    struct Prefix {
+        var seq: Int64
+        var oseq: Int64
+        var ts: Int64
+        var levelRank: Int
+        /// 级别值结尾引号之后的位置（下一个字段从这里开始）。
+        var end: Int = 0
+    }
 
     private static let pSeq = Array("{\"seq\":".utf8)
     private static let pOseq = Array("\"oseq\":".utf8)
@@ -153,7 +182,7 @@ enum Segments {
         var j = i
         while j < end && d[j] != 0x22 { j += 1 }
         guard j < end, let lvl = LogLevel(rawValue: String(decoding: d[i..<j], as: UTF8.self)) else { return nil }
-        return Prefix(seq: seq, oseq: oseq, ts: ts, levelRank: lvl.rank)
+        return Prefix(seq: seq, oseq: oseq, ts: ts, levelRank: lvl.rank, end: j + 1)
     }
 
     /// 残行只剩前缀一部分时尽量认出 seq / oseq。
@@ -175,6 +204,67 @@ enum Segments {
             if got, i < r.upperBound, d[i] == 0x2C { oseq = v }
         }
         return (seq, oseq)
+    }
+
+    // MARK: 按位置判定（ADR 0024 决定 9）：行尾的固定字段与 msg 之后的 tag；attrs 里的同名键不会命中
+
+    private static let tailTruncated = Array(",\"truncated\":true".utf8)
+    private static let tailSynthetic = Array(",\"synthetic\":true".utf8)
+    private static let tailCtx = Array(",\"ctx\":true".utf8)
+
+    /// 行尾的固定字段（按写出顺序 `…[,"ctx":true][,"synthetic":true][,"truncated":true]}`，从行尾往回认）。
+    /// 字符串值里的 `"` 一律转义，attrs / exc 以 `}` 结尾，所以这些模式只可能是顶层字段。
+    struct Tail { var ctx = false; var synthetic = false; var truncated = false }
+
+    static func tail(_ raw: ArraySlice<UInt8>) -> Tail {
+        var t = Tail()
+        guard let last = raw.last, last == 0x7D else { return t }
+        var end = raw.endIndex - 1
+        func strip(_ p: [UInt8]) -> Bool {
+            guard end - raw.startIndex >= p.count else { return false }
+            let s = raw[(end - p.count)..<end]
+            guard s.elementsEqual(p) else { return false }
+            end -= p.count
+            return true
+        }
+        t.truncated = strip(tailTruncated)
+        t.synthetic = strip(tailSynthetic)
+        t.ctx = strip(tailCtx)
+        return t
+    }
+
+    private static let pMsg = Array(",\"msg\":\"".utf8)
+    private static let pTag = Array(",\"tag\":\"".utf8)
+
+    /// 行的 tag（紧跟 msg 之后的固定位置；没有 tag 返回 nil）。`raw` 是带前缀的整行（段文件 / 信封里的行）。
+    static func tag(_ raw: ArraySlice<UInt8>) -> String? {
+        let d = Array(raw)
+        guard let p = parsePrefix(d, 0..<d.count) else { return nil }
+        var i = p.end
+        guard i + pMsg.count <= d.count, Array(d[i..<(i + pMsg.count)]) == pMsg else { return nil }
+        i += pMsg.count
+        // 跳过 msg 字符串（转义感知）
+        var esc = false
+        while i < d.count {
+            let c = d[i]
+            if esc { esc = false } else if c == 0x5C { esc = true } else if c == 0x22 { break }
+            i += 1
+        }
+        guard i < d.count else { return nil }
+        i += 1
+        guard i + pTag.count <= d.count, Array(d[i..<(i + pTag.count)]) == pTag else { return nil }
+        i += pTag.count
+        let start = i
+        esc = false
+        while i < d.count {
+            let c = d[i]
+            if esc { esc = false } else if c == 0x5C { esc = true } else if c == 0x22 { break }
+            i += 1
+        }
+        guard i < d.count else { return nil }
+        // 我们写出的 tag 只可能含转义序列；按 JSON 字符串解出来比较
+        let lit = [0x22] + Array(d[start..<i]) + [0x22]
+        return (try? JSONSerialization.jsonObject(with: Data(lit), options: [.fragmentsAllowed])) as? String
     }
 
     private static let ctxInsertBefore: [[UInt8]] = [

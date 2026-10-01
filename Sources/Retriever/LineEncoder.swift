@@ -24,8 +24,9 @@ enum LineEncoder {
         return LogException(type: String(reflecting: t), message: String(describing: error), stack: nil)
     }
 
-    static func encode(_ line: LogLine, synthetic: Bool = false) -> Encoded {
-        var truncated = false
+    /// `truncated`：行原本已被截断（收编时重编码过 redact 的 pre 行：与原值取或，ADR 0023）。
+    static func encode(_ line: LogLine, synthetic: Bool = false, truncated alreadyTruncated: Bool = false) -> Encoded {
+        var truncated = alreadyTruncated
 
         let (msg0, tm) = Text.truncate(line.msg, maxBytes: Limits.lineMsgBytes)
         var msg = msg0

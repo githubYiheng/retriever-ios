@@ -34,7 +34,12 @@ final class ConfigTests: XCTestCase {
         h.client.log(.info, "obligation now")
         XCTAssertEqual(h.client.debugCounters.seq, before.seq + 1)
         XCTAssertEqual(h.client.debugCounters.oseq, before.oseq + 1)
-        // 缓存到 config.json，重启后按墙钟兜底
+        // 缓存到 config.json，重启后按墙钟兜底。缓存记着为谁拉的（user_id，盲审裁决 4）：重启时初始用户是 nil，
+        // 所以先切回 nil（按新身份重拉、缓存 user_id = null），重启后才是同一身份、照用缓存
+        h.client.setUser(nil)
+        await h.settle()
+        XCTAssertTrue(h.json("config.json")?.keys.contains("user_id") == true)
+        XCTAssertTrue(h.json("config.json")?["user_id"] is NSNull)
         let h2 = Harness(root: h.root, clock: h.clock, transport: FakeTransport())
         await h2.settle()
         let eff = await h2.work { $0.effective }

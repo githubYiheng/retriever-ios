@@ -168,6 +168,8 @@ public enum PlatformEvent: Sendable {
     case protectedDataWillBecomeUnavailable
     case protectedDataDidBecomeAvailable
     case networkRestored
+    /// 进程级 tracker 读到（或补读到）真实前后台状态：只更新会话的 last_state，不封段、不排空（ADR 0023 决定 6）。
+    case foregroundStateChanged(Bool)
 }
 
 /// 生命周期事件接收方（RetrieverClient）。
@@ -181,7 +183,8 @@ public protocol PlatformEventSink: AnyObject, Sendable {
 public protocol PlatformHooks: Sendable {
     /// 设备快照字段（不含 sdk）。
     func deviceFields() -> [String: String]
-    /// 启动时是否在前台（写初始 last_state）；nil = 无前后台概念（app 扩展）→ last_state 留空，退出判 unknown。
+    /// 当前是否在前台（新会话的初始 last_state）；nil = 未知或无前后台概念（app 扩展）→ last_state 留空，退出判 unknown。
+    /// 任意线程可调（读进程级 tracker 的缓存值，不碰 UIKit）。
     func isForeground() -> Bool?
     /// `beginBackgroundTask`；返回令牌（nil = 平台不支持 / 拿不到）。
     func beginBackgroundTask(name: String, onExpire: @escaping @Sendable () -> Void) -> Int?
@@ -202,6 +205,9 @@ public final class SystemPlatform: PlatformHooks, @unchecked Sendable {
     #endif
 
     public init() {}
+
+    /// 首次触达 SDK 时装进程级前后台 tracker（ADR 0023 决定 6）。
+    public static func installTracker() { ForegroundTracker.shared.install() }
 
     public func deviceFields() -> [String: String] {
         var sys = utsname()
@@ -235,11 +241,8 @@ public final class SystemPlatform: PlatformHooks, @unchecked Sendable {
 
     public func isForeground() -> Bool? {
         #if canImport(UIKit) && !os(watchOS)
-        guard let app = SystemPlatform.sharedApplication() else { return nil }
-        if Thread.isMainThread {
-            return MainActor.assumeIsolated { app.applicationState != .background }
-        }
-        return true
+        ForegroundTracker.shared.install()
+        return ForegroundTracker.shared.state
         #else
         return true
         #endif
@@ -281,10 +284,11 @@ public final class SystemPlatform: PlatformHooks, @unchecked Sendable {
     public func startObserving(_ sink: any PlatformEventSink) {
         let post: @Sendable (PlatformEvent) -> Void = { [weak sink] e in sink?.platformEvent(e) }
         #if canImport(UIKit) && !os(watchOS)
+        // 前后台事件由进程级 tracker 转发（它从首次触达 SDK 起就在记，不依赖实例何时建成）
+        ForegroundTracker.shared.install()
+        ForegroundTracker.shared.subscribe(sink)
         let nc = NotificationCenter.default
         let pairs: [(Notification.Name, PlatformEvent)] = [
-            (UIApplication.didEnterBackgroundNotification, .didEnterBackground),
-            (UIApplication.willEnterForegroundNotification, .willEnterForeground),
             (UIApplication.protectedDataWillBecomeUnavailableNotification, .protectedDataWillBecomeUnavailable),
             (UIApplication.protectedDataDidBecomeAvailableNotification, .protectedDataDidBecomeAvailable),
         ]
@@ -323,3 +327,148 @@ public final class SystemPlatform: PlatformHooks, @unchecked Sendable {
         #endif
     }
 }
+
+/// tracker 的平台边界（可注入，测试用假实现驱动状态机；UIKit 的真实行为留给模拟器验收）。
+protocol ForegroundSource: AnyObject, Sendable {
+    /// 有前后台概念（扩展里没有 → tracker 不装，状态恒为 nil）。
+    var available: Bool { get }
+    var isMainThread: Bool { get }
+    /// 在主线程上调：读真实状态（UIApplication 还没建好 → nil，保持原值）。
+    func readForeground() -> Bool?
+    func onMain(_ f: @escaping @Sendable () -> Void)
+    /// 开始把前后台通知送给 handler（在主线程上调 handler）。
+    func observe(_ handler: @escaping @Sendable (ForegroundNote) -> Void)
+}
+
+enum ForegroundNote: Sendable { case didEnterBackground, willEnterForeground, didBecomeActive, willResignActive }
+
+/// 进程级前后台 tracker（ADR 0023 决定 6；简报 §1.4）：首次触达 SDK 时安装，不依赖实例。
+/// - 初值只在主线程上读：主线程触达 → 当场读；非主线程 → 先记 unknown（不是前台），切到主线程补读；
+/// - didEnterBackground / willEnterForeground 是明确的状态；didBecomeActive / willResignActive 时在主线程上重读真实状态；
+/// - 扩展里（没有 UIApplication）不装：状态恒为 nil（无前后台概念）。
+/// 实例订阅它：新会话的 last_state 取当前值；状态变化转成 `PlatformEvent` 送给实例。
+final class ForegroundTracker: @unchecked Sendable {
+    static let shared = ForegroundTracker(source: ForegroundTracker.systemSource())
+
+    private let source: any ForegroundSource
+    private let lock = NSLock()
+    private var installed = false
+    private var current: Bool?
+    private var sinks: [WeakSink] = []
+
+    private struct WeakSink { weak var sink: (any PlatformEventSink)? }
+
+    init(source: any ForegroundSource) { self.source = source }
+
+    var state: Bool? {
+        lock.lock(); defer { lock.unlock() }
+        return current
+    }
+
+    func subscribe(_ sink: any PlatformEventSink) {
+        lock.lock()
+        sinks.removeAll { $0.sink == nil }
+        sinks.append(WeakSink(sink: sink))
+        lock.unlock()
+    }
+
+    private func post(_ e: PlatformEvent) {
+        lock.lock()
+        let targets = sinks.compactMap(\.sink)
+        lock.unlock()
+        for t in targets { t.platformEvent(e) }
+    }
+
+    /// 设状态；变了（含 unknown → 已知）返回 true。
+    private func set(_ fg: Bool) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let changed = current != fg
+        current = fg
+        return changed
+    }
+
+    func install() {
+        lock.lock()
+        if installed { lock.unlock(); return }
+        installed = true
+        lock.unlock()
+        guard source.available else { return }
+        source.observe { [weak self] note in self?.handle(note) }
+        if source.isMainThread {
+            resync()
+        } else {
+            source.onMain { [weak self] in self?.resync() }
+        }
+    }
+
+    func handle(_ note: ForegroundNote) {
+        switch note {
+        case .didEnterBackground:
+            _ = set(false)
+            post(.didEnterBackground)
+        case .willEnterForeground:
+            _ = set(true)
+            post(.willEnterForeground)
+        case .didBecomeActive, .willResignActive:
+            resync()
+        }
+    }
+
+    /// 主线程：重读真实状态（读不到时保持原值，等下一次通知）。
+    private func resync() {
+        guard let fg = source.readForeground() else { return }
+        if set(fg) { post(.foregroundStateChanged(fg)) }
+    }
+
+    static func systemSource() -> any ForegroundSource {
+        #if canImport(UIKit) && !os(watchOS)
+        return UIKitForegroundSource()
+        #else
+        return NoForegroundSource()
+        #endif
+    }
+}
+
+/// 没有前后台概念的平台（macOS 包测试、watchOS）。
+final class NoForegroundSource: ForegroundSource, @unchecked Sendable {
+    var available: Bool { false }
+    var isMainThread: Bool { Thread.isMainThread }
+    func readForeground() -> Bool? { nil }
+    func onMain(_ f: @escaping @Sendable () -> Void) {}
+    func observe(_ handler: @escaping @Sendable (ForegroundNote) -> Void) {}
+}
+
+#if canImport(UIKit) && !os(watchOS)
+final class UIKitForegroundSource: ForegroundSource, @unchecked Sendable {
+    private let lock = NSLock()
+    private var observers: [NSObjectProtocol] = []
+
+    var available: Bool { !Bundle.main.bundlePath.hasSuffix(".appex") }
+    var isMainThread: Bool { Thread.isMainThread }
+
+    func readForeground() -> Bool? {
+        guard let app = SystemPlatform.sharedApplication() else { return nil }
+        return MainActor.assumeIsolated { app.applicationState != .background }
+    }
+
+    func onMain(_ f: @escaping @Sendable () -> Void) { DispatchQueue.main.async(execute: f) }
+
+    func observe(_ handler: @escaping @Sendable (ForegroundNote) -> Void) {
+        let nc = NotificationCenter.default
+        let pairs: [(Notification.Name, ForegroundNote)] = [
+            (UIApplication.didEnterBackgroundNotification, .didEnterBackground),
+            (UIApplication.willEnterForegroundNotification, .willEnterForeground),
+            (UIApplication.didBecomeActiveNotification, .didBecomeActive),
+            (UIApplication.willResignActiveNotification, .willResignActive),
+        ]
+        var tokens: [NSObjectProtocol] = []
+        for (name, note) in pairs {
+            tokens.append(nc.addObserver(forName: name, object: nil, queue: .main) { _ in handler(note) })
+        }
+        lock.lock()
+        observers = tokens
+        lock.unlock()
+    }
+}
+#endif
